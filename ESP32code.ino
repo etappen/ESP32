@@ -16,6 +16,13 @@ int joystickX = 0;  // -100 to 100
 int joystickY = 0;  // -100 to 100
 bool joystickMode = true;  // Enable joystick control by default
 
+// Motor speed smoothing variables for gradual acceleration/deceleration
+int currentLeftSpeed = 0;   // Current left motor speed
+int currentRightSpeed = 0;  // Current right motor speed
+int targetLeftSpeed = 0;    // Target left motor speed
+int targetRightSpeed = 0;   // Target right motor speed
+const int ACCEL_RATE = 15;  // Speed change per update cycle (higher = faster response)
+
 // ============================================================================
 // ENCODER MODULE
 // ============================================================================
@@ -595,51 +602,87 @@ void motorRight(uint8_t speed) {
 
 // CALLED BY: loop() when joystickMode is enabled
 // Maps virtual joystick X/Y values to differential motor speeds
-// Joystick control function - implements tank/differential drive
+// Joystick control function - implements tank/differential drive with gradual turning
 void handleJoystickControl(int joyX, int joyY) {
   // INPUT: joyX and joyY are in range -100 to 100 from web interface
   //   joyY: Forward/Backward (positive = forward, negative = backward)
   //   joyX: Left/Right turning (positive = turn right, negative = turn left)
   
+  // Deadzone to prevent drift from small joystick movements (5% threshold)
+  const int DEADZONE = 5;
+  if (abs(joyX) < DEADZONE) joyX = 0;
+  if (abs(joyY) < DEADZONE) joyY = 0;
+  
+  // Scale joystick inputs to motor PWM range (0-255)
+  // Using 2.55 multiplier to convert -100..100 range to -255..255
+  float scaledY = joyY * 2.55;
+  
+  // Reduce turning sensitivity for more gradual turns (50% of forward speed)
+  // This makes slight joystick movements produce gentle curves
+  float scaledX = joyX * 1.275;  // 50% turning rate (half of 2.55)
+  
   // Calculate differential drive motor speeds
   // Left motor: forward speed minus turning (turning right reduces left speed)
   // Right motor: forward speed plus turning (turning right increases right speed)
-  int leftMotorSpeed = joyY - joyX;
-  int rightMotorSpeed = joyY + joyX;
+  targetLeftSpeed = (int)(scaledY - scaledX);
+  targetRightSpeed = (int)(scaledY + scaledX);
 
   // Limit motor speeds to valid PWM range [-255, 255]
-  leftMotorSpeed = constrain(leftMotorSpeed, -255, 255);
-  rightMotorSpeed = constrain(rightMotorSpeed, -255, 255);
+  targetLeftSpeed = constrain(targetLeftSpeed, -255, 255);
+  targetRightSpeed = constrain(targetRightSpeed, -255, 255);
 
-  // Apply calculated speeds to motors
-  if (leftMotorSpeed == 0 && rightMotorSpeed == 0) {
-    motorStop();  // CALLS: motorStop() when joystick is centered
+  // Apply minimum speed threshold to overcome motor friction (25 PWM)
+  const int MIN_SPEED = 25;
+  if (abs(targetLeftSpeed) > 0 && abs(targetLeftSpeed) < MIN_SPEED) {
+    targetLeftSpeed = (targetLeftSpeed > 0) ? MIN_SPEED : -MIN_SPEED;
+  }
+  if (abs(targetRightSpeed) > 0 && abs(targetRightSpeed) < MIN_SPEED) {
+    targetRightSpeed = (targetRightSpeed > 0) ? MIN_SPEED : -MIN_SPEED;
+  }
+
+  // Smooth acceleration/deceleration - gradually move current speed toward target
+  // This prevents jerky movements by limiting speed changes per update cycle
+  if (currentLeftSpeed < targetLeftSpeed) {
+    currentLeftSpeed = min(currentLeftSpeed + ACCEL_RATE, targetLeftSpeed);
+  } else if (currentLeftSpeed > targetLeftSpeed) {
+    currentLeftSpeed = max(currentLeftSpeed - ACCEL_RATE, targetLeftSpeed);
+  }
+  
+  if (currentRightSpeed < targetRightSpeed) {
+    currentRightSpeed = min(currentRightSpeed + ACCEL_RATE, targetRightSpeed);
+  } else if (currentRightSpeed > targetRightSpeed) {
+    currentRightSpeed = max(currentRightSpeed - ACCEL_RATE, targetRightSpeed);
+  }
+
+  // Apply smoothed speeds to motors
+  if (currentLeftSpeed == 0 && currentRightSpeed == 0) {
+    motorStop();  // CALLS: motorStop() when both motors at zero
   } else {
     // Left motor
-    if (leftMotorSpeed > 0) {
+    if (currentLeftSpeed > 0) {
       digitalWrite(LEFT_IN1, HIGH);
       digitalWrite(LEFT_IN2, LOW);
-    } else if (leftMotorSpeed < 0) {
+    } else if (currentLeftSpeed < 0) {
       digitalWrite(LEFT_IN1, LOW);
       digitalWrite(LEFT_IN2, HIGH);
     } else {
       digitalWrite(LEFT_IN1, LOW);
       digitalWrite(LEFT_IN2, LOW);
     }
-    analogWrite(LEFT_EN, abs(leftMotorSpeed));
+    analogWrite(LEFT_EN, abs(currentLeftSpeed));
 
     // Right motor
-    if (rightMotorSpeed > 0) {
+    if (currentRightSpeed > 0) {
       digitalWrite(RIGHT_IN1, HIGH);
       digitalWrite(RIGHT_IN2, LOW);
-    } else if (rightMotorSpeed < 0) {
+    } else if (currentRightSpeed < 0) {
       digitalWrite(RIGHT_IN1, LOW);
       digitalWrite(RIGHT_IN2, HIGH);
     } else {
       digitalWrite(RIGHT_IN1, LOW);
       digitalWrite(RIGHT_IN2, LOW);
     }
-    analogWrite(RIGHT_EN, abs(rightMotorSpeed));
+    analogWrite(RIGHT_EN, abs(currentRightSpeed));
   }
 }
 
@@ -726,6 +769,11 @@ void handleClient(WiFiClient client) {
   } else if (requestLine.indexOf("GET /linefollow/start") == 0) {
     lineFollowing = true;   // Set flag, loop() will call runLineFollow()
     joystickMode = false;   // Disable joystick when line following starts
+    // Reset smoothing variables
+    currentLeftSpeed = 0;
+    currentRightSpeed = 0;
+    targetLeftSpeed = 0;
+    targetRightSpeed = 0;
     responseBody = "<html><body><h1>Line follow started</h1></body></html>";
     
   // ENDPOINT: /linefollow/stop - Disable line following mode
@@ -739,6 +787,11 @@ void handleClient(WiFiClient client) {
     digitalWrite(RIGHT_IN1, LOW);
     digitalWrite(RIGHT_IN2, LOW);
     digitalWrite(RIGHT_EN, LOW);
+    // Reset smoothing variables
+    currentLeftSpeed = 0;
+    currentRightSpeed = 0;
+    targetLeftSpeed = 0;
+    targetRightSpeed = 0;
     responseBody = "<html><body><h1>Line follow stopped</h1></body></html>";
     
   // ENDPOINT: /linefollow/toggle - Toggle line following on/off
@@ -754,6 +807,11 @@ void handleClient(WiFiClient client) {
       digitalWrite(RIGHT_IN2, LOW);
       digitalWrite(RIGHT_EN, LOW);
     }
+    // Reset smoothing variables
+    currentLeftSpeed = 0;
+    currentRightSpeed = 0;
+    targetLeftSpeed = 0;
+    targetRightSpeed = 0;
     responseBody = String("<html><body><h1>Line follow ") + (lineFollowing ? "started" : "stopped") + "</h1></body></html>";
     
   // ENDPOINT: /linefollow/status - Get current sensor reading and state
