@@ -65,6 +65,12 @@ long sensorReading = 0;
 bool lineFollowing = false;
 unsigned long lastUpdate = 0;
 
+// Line following state machine variables (for non-blocking sweep)
+int sweepDuration = 7;          // Current sweep duration in ms
+bool sweepingLeft = true;       // Current sweep direction
+unsigned long sweepStartTime = 0;  // When current sweep began
+bool inSweep = false;           // Whether we're currently sweeping
+
 // ============================================================================
 // ULTRASONIC SENSOR MODULE
 // ============================================================================
@@ -82,11 +88,23 @@ long distanceCm = 0;
 const int BUZZER_FREQ = 2000; // 2 kHz default tone
 const int BUZZER_RES = 8;     // 8-bit resolution (0-255)
 
+// Non-blocking buzzer state tracking
+bool buzzerActive = false;
+unsigned long buzzerEndTime = 0;
+const unsigned long BUZZER_DURATION_MS = 300;
+
 // ============================================================================
 // LAMPS MODULE
 // ============================================================================
 #define FRONTLAMPS 2
 #define REARLAMPS 0
+
+// Non-blocking lamp state tracking
+bool frontLampActive = false;
+unsigned long frontLampEndTime = 0;
+bool rearLampActive = false;
+unsigned long rearLampEndTime = 0;
+const unsigned long LAMP_DURATION_MS = 1000;
 
 // ============================================================================
 // SIREN MODULE
@@ -197,12 +215,12 @@ void sendHttpResponse(WiFiClient &client, const String &body) {
 }
 
 // CALLED BY: readUltrasonicDistance(), loop() (legacy) - Averages multiple analog readings
-// Takes multiple sensor samples and returns the average to reduce noise
+// Takes multiple sensor samples and returns the average to reduce noise (non-blocking version)
 long readAverage(int pin, int samples) {
   long sum = 0;
   for (int i = 0; i < samples; ++i) {
     sum += analogRead(pin);  // Read analog value
-    delay(2);                // Small delay between readings
+    // Removed delay - readings happen immediately
   }
   return sum / samples;      // Return average
 }
@@ -213,7 +231,7 @@ long readAverage(int pin, int samples) {
 
 // CALLED BY: loop() - Measures distance to obstacles using HC-SR04 sensor
 // Returns: Distance in centimeters, or 0 if no valid reading
-// Uses multiple samples (ULTRASONIC_SAMPLES) and averages them for accuracy
+// Uses multiple samples (ULTRASONIC_SAMPLES) and averages them for accuracy (non-blocking)
 long readUltrasonicDistance() {
   long totalDistance = 0;  // Accumulator for valid distance readings
   int valid = 0;           // Count of successful readings
@@ -228,9 +246,6 @@ long readUltrasonicDistance() {
     digitalWrite(TRIG_PIN, LOW);
 
     long duration = pulseIn(ECHO_PIN, HIGH, 30000);  // 30ms timeout
-    // if (ULTRASONIC_DEBUG) {
-    //   Serial.print("Ultrasonic raw duration: "); Serial.println(duration);
-    // }
     if (duration > 0) {
       // distance = (duration in microseconds * speed of sound) / 2
       // speed of sound = 343 m/s = 0.0343 cm/microsecond
@@ -238,18 +253,14 @@ long readUltrasonicDistance() {
       totalDistance += distance;
       valid++;
     }
-    delay(10);
+    // Removed delay between samples - measurements happen immediately
   }
 
   if (valid == 0) {
-    // if (ULTRASONIC_DEBUG) Serial.println("Ultrasonic: timeout / no echo");
     return 0;
   }
 
   long avg = totalDistance / valid;
-  // if (ULTRASONIC_DEBUG) {
-  //   Serial.print("Ultrasonic distance (cm) avg: "); Serial.println(avg);
-  // }
   return avg;
 }
 
@@ -312,7 +323,8 @@ void stop() {
 }
 
 // CALLED BY: loop() when lineFollowing == true
-// Main line following algorithm with expanding sweep pattern
+// Main line following algorithm with expanding sweep pattern (NON-BLOCKING)
+// Uses state machine to avoid blocking delays
 // CALLS: seesBlack(), forward(), left(), right(), stop()
 void runLineFollow() {
   unsigned long now = millis();
@@ -324,68 +336,49 @@ void runLineFollow() {
   // If on the line, just go forward
   if (seesBlack()) {
     forward();  // CALLS: forward() to move straight
+    inSweep = false;
     return;
   }
 
-  // Line lost - sweep left/right in expanding pattern to find it again
-  // Pattern: left 7ms, right 7ms, left 14ms, right 14ms, left 21ms, etc.
-  int sweep = 7;           // Start with 7ms sweep duration
-  int sweepRight = 7;      // (unused variable)
-  bool goingLeft = true;   // Track sweep direction
-  int stepsLeft = 0;       // (unused variable)
-  
-  // Keep sweeping until line is found
-  // CALLS: seesBlack(), left(), right()
-  while (!seesBlack()) {
-
-    // Alternate between left and right sweeps
-    if(goingLeft == true){
-      left();              // CALLS: left() - turn left
-      delay(sweep);        // Hold turn for 'sweep' milliseconds
-      goingLeft = false;   // Next iteration will turn right
-      
-      // If we found the line during the turn, add small correction
-      if(seesBlack()){
-        left();            // CALLS: left() - additional correction turn
-        delay(3);          // Brief 3ms correction
-      }
-    }else{
-      right();             // CALLS: right() - turn right
-      delay(sweep);        // Hold turn for 'sweep' milliseconds
-      goingLeft = true;    // Next iteration will turn left
-      
-      // If we found the line during the turn, add small correction
-      if(seesBlack()){
-        right();           // CALLS: right() - additional correction turn
-        delay(3);          // Brief 3ms correction
-      }
-    }
-    
-    // Reset sweep (unclear logic - may be redundant)
-    // Appears to be attempting another sweep if line still not found
-    if(!seesBlack()){
-      if(goingLeft == true){
-        left();            // CALLS: left()
-        delay(sweep);
-      }else{
-        right();           // CALLS: right()
-        delay(sweep);
-      }
-    }
-    
-    // Expand the sweep duration for next iteration
-    sweep += 7;  // Increases by 7ms each cycle (7, 14, 21, 28...)
-   
+  // Line lost - use state machine for non-blocking sweep
+  if (!inSweep) {
+    // Start new sweep
+    inSweep = true;
+    sweepStartTime = now;
   }
 
-  // After exiting while loop, check if we're on the line
-  if (seesBlack()) {
-    forward();  // CALLS: forward() to continue following
-    return;
+  unsigned long sweepElapsed = now - sweepStartTime;
+
+  // Check if current sweep is complete
+  if (sweepElapsed >= sweepDuration) {
+    // Sweep finished, check if we found the line
+    if (seesBlack()) {
+      forward();  // CALLS: forward() if line found
+      inSweep = false;
+      return;
+    }
+    
+    // Line not found during sweep - alternate direction and expand sweep duration
+    sweepingLeft = !sweepingLeft;
+    sweepDuration += 7;  // Expand sweep by 7ms
+    
+    // Safety limit: if sweep gets too large, stop searching
+    if (sweepDuration > 100) {
+      stop();  // CALLS: stop() if sweep exceeds 100ms
+      inSweep = false;
+      return;
+    }
+    
+    // Start next sweep
+    sweepStartTime = now;
   }
 
-  // If still nothing found (shouldn't reach here due to while loop), stop
-  stop();  // CALLS: stop()
+  // Apply current sweep direction
+  if (sweepingLeft) {
+    left();   // CALLS: left() - turn left
+  } else {
+    right();  // CALLS: right() - turn right
+  }
 }
 
 // ============================================================================
@@ -393,11 +386,21 @@ void runLineFollow() {
 // ============================================================================
 
 // CALLED BY: handleClient() when /buzzer endpoint is requested
-// Plays a test beep sound for 300ms using PWM tone generation
+// Starts a non-blocking buzzer beep (300ms duration)
 void BuzzerTest() {
-  ledcWriteTone(BUZZER_PIN, BUZZER_FREQ);  // Turn on buzzer at 2000 Hz
-  delay(300);                               // Hold tone for 300ms (blocking)
-  ledcWriteTone(BUZZER_PIN, 0);             // Turn off buzzer
+  buzzerActive = true;
+  buzzerEndTime = millis() + BUZZER_DURATION_MS;  // Set end time
+  ledcWriteTone(BUZZER_PIN, BUZZER_FREQ);  // Turn on buzzer
+}
+
+// CALLED BY: loop() every iteration - Updates buzzer (non-blocking)
+void updateBuzzer() {
+  if (!buzzerActive) return;  // Exit if buzzer is off
+  
+  if (millis() >= buzzerEndTime) {
+    buzzerActive = false;
+    ledcWriteTone(BUZZER_PIN, 0);  // Turn off buzzer
+  }
 }
 
 // CALLED BY: (Legacy function, not currently used in code)
@@ -421,19 +424,32 @@ void playTone(int pin, int freq, int duration_ms) {
 // ============================================================================
 
 // CALLED BY: handleClient() when /front endpoint is requested
-// Turns front lamps on for 1 second then off (blocking)
+// Starts non-blocking front lamp effect (1 second duration)
 void FrontLampTest(){
+  frontLampActive = true;
+  frontLampEndTime = millis() + LAMP_DURATION_MS;  // Set end time
   digitalWrite(FRONTLAMPS, HIGH);  // Turn on front lamps
-  delay(1000);                     // Hold for 1 second (blocking)
-  digitalWrite(FRONTLAMPS, LOW);   // Turn off front lamps
 }
 
 // CALLED BY: handleClient() when /rear endpoint is requested
-// Turns rear lamps on for 1 second then off (blocking)
+// Starts non-blocking rear lamp effect (1 second duration)
 void RearLampTest(){
+  rearLampActive = true;
+  rearLampEndTime = millis() + LAMP_DURATION_MS;  // Set end time
   digitalWrite(REARLAMPS, HIGH);   // Turn on rear lamps
-  delay(1000);                     // Hold for 1 second (blocking)
-  digitalWrite(REARLAMPS, LOW);    // Turn off rear lamps
+}
+
+// CALLED BY: loop() every iteration - Updates lamps (non-blocking)
+void updateLamps() {
+  if (frontLampActive && millis() >= frontLampEndTime) {
+    frontLampActive = false;
+    digitalWrite(FRONTLAMPS, LOW);  // Turn off front lamps
+  }
+  
+  if (rearLampActive && millis() >= rearLampEndTime) {
+    rearLampActive = false;
+    digitalWrite(REARLAMPS, LOW);   // Turn off rear lamps
+  }
 }
 
 // ============================================================================
@@ -694,24 +710,26 @@ void handleJoystickControl(int joyX, int joyY) {
 void handleClient(WiFiClient client) {
   if (!client) return;  // Exit if no valid client
 
-  String currentLine = "";   // Current line being read from HTTP request
   String requestLine = "";   // First line of request (contains URL/endpoint)
-
-  // Read HTTP request headers from client
-  while (client.connected()) {
-    if (client.available()) {
-      char c = client.read();
-      if (c == '\n') {
-        if (currentLine.length() == 0) {
-          break; // Empty line = end of HTTP headers
-        }
-        // Save first line which contains the URL endpoint
-        if (requestLine.length() == 0) requestLine = currentLine;
-        currentLine = "";
-      } else if (c != '\r') {
-        currentLine += c;  // Build current line character by character
-      }
+  
+  // Read only the first line of the HTTP request (non-blocking timeout)
+  unsigned long startTime = millis();
+  const int TIMEOUT_MS = 100;  // 100ms timeout for reading request
+  
+  while (client.available() && requestLine.indexOf('\n') == -1) {
+    if (millis() - startTime > TIMEOUT_MS) break;  // Timeout to prevent hanging
+    
+    char c = client.read();
+    if (c == '\n') {
+      break;  // Got complete first line
+    } else if (c != '\r') {
+      requestLine += c;  // Build first line character by character
     }
+  }
+  
+  // Drain remaining data from client to clear the buffer
+  while (client.available()) {
+    client.read();
   }
 
   String responseBody = "";  // HTML response to send back to browser
@@ -772,6 +790,10 @@ void handleClient(WiFiClient client) {
     currentRightSpeed = 0;
     targetLeftSpeed = 0;
     targetRightSpeed = 0;
+    // Reset sweep state variables
+    sweepDuration = 7;
+    sweepingLeft = true;
+    inSweep = false;
     responseBody = "<html><body><h1>Line follow started</h1></body></html>";
     
   // ENDPOINT: /linefollow/stop - Disable line following mode
@@ -790,6 +812,10 @@ void handleClient(WiFiClient client) {
     currentRightSpeed = 0;
     targetLeftSpeed = 0;
     targetRightSpeed = 0;
+    // Reset sweep state variables
+    sweepDuration = 7;
+    sweepingLeft = true;
+    inSweep = false;
     responseBody = "<html><body><h1>Line follow stopped</h1></body></html>";
     
   // ENDPOINT: /linefollow/toggle - Toggle line following on/off
@@ -810,6 +836,10 @@ void handleClient(WiFiClient client) {
     currentRightSpeed = 0;
     targetLeftSpeed = 0;
     targetRightSpeed = 0;
+    // Reset sweep state variables
+    sweepDuration = 7;
+    sweepingLeft = true;
+    inSweep = false;
     responseBody = String("<html><body><h1>Line follow ") + (lineFollowing ? "started" : "stopped") + "</h1></body></html>";
     
   // ENDPOINT: /linefollow/status - Get current sensor reading and state
@@ -818,20 +848,27 @@ void handleClient(WiFiClient client) {
     
   // ENDPOINT: /status - Get all status values as JSON for dynamic updates
   } else if (requestLine.indexOf("GET /status") == 0) {
-    responseBody = "{";
-    responseBody += "\"sensor\":" + String(sensorReading) + ",";
-    responseBody += "\"lineFollowing\":" + String(lineFollowing ? "true" : "false") + ",";
-    responseBody += "\"joystickMode\":" + String(joystickMode ? "true" : "false") + ",";
-    responseBody += "\"distanceCm\":" + String(distanceCm) + ",";
-    responseBody += "\"leftEncoder\":" + String(leftEncoderCount) + ",";
-    responseBody += "\"rightEncoder\":" + String(rightEncoderCount);
-    responseBody += "}";
+    // Send JSON response directly with minimal overhead
     client.println("HTTP/1.1 200 OK");
     client.println("Content-Type: application/json");
     client.println("Connection: close");
     client.println();
-    client.println(responseBody);
-    delay(1);
+    
+    // Build and send JSON in one go
+    client.print("{\"sensor\":");
+    client.print(sensorReading);
+    client.print(",\"lineFollowing\":");
+    client.print(lineFollowing ? "true" : "false");
+    client.print(",\"joystickMode\":");
+    client.print(joystickMode ? "true" : "false");
+    client.print(",\"distanceCm\":");
+    client.print(distanceCm);
+    client.print(",\"leftEncoder\":");
+    client.print(leftEncoderCount);
+    client.print(",\"rightEncoder\":");
+    client.println(rightEncoderCount);
+    client.println("}");
+    
     client.stop();
     return;
     
@@ -858,8 +895,19 @@ void handleClient(WiFiClient client) {
     String yStr = requestLine.substring(yStart, yEnd);
     joystickY = yStr.toInt();  // Update global joystickY variable
     
-    // Return JSON response confirming values received
-    responseBody = "{\"status\":\"ok\",\"x\":" + String(joystickX) + ",\"y\":" + String(joystickY) + "}";
+    // Send minimal JSON response for fast acknowledgement
+    client.println("HTTP/1.1 200 OK");
+    client.println("Content-Type: application/json");
+    client.println("Connection: close");
+    client.println();
+    client.print("{\"x\":");
+    client.print(joystickX);
+    client.print(",\"y\":");
+    client.print(joystickY);
+    client.println("}");
+    
+    client.stop();
+    return;
     
   // DEFAULT: No specific endpoint - send main web interface HTML page
   // This massive HTML page contains the interactive control panel with:
@@ -1113,6 +1161,12 @@ void loop() {
   
   // CALLS: updateSiren() - Update siren effect if active (non-blocking)
   updateSiren();
+  
+  // CALLS: updateBuzzer() - Update buzzer state if active (non-blocking)
+  updateBuzzer();
+  
+  // CALLS: updateLamps() - Update lamp states if active (non-blocking)
+  updateLamps();
   
   // Rate-limited sensor reading and control logic (every READ_INTERVAL_MS = 20ms)
   if (now - lastLineRead >= READ_INTERVAL_MS) {
