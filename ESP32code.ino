@@ -79,7 +79,6 @@ long distanceCm = 0;
 // BUZZER MODULE
 // ============================================================================
 #define BUZZER_PIN 21
-const int BUZZER_CH = 0;
 const int BUZZER_FREQ = 2000; // 2 kHz default tone
 const int BUZZER_RES = 8;     // 8-bit resolution (0-255)
 
@@ -166,9 +165,8 @@ void setup() {
   // Configure PWM (LEDC) for buzzer tone generation
   // USED BY: BuzzerTest(), playTone(), startSiren(), stopSiren(), updateSiren()
   pinMode(BUZZER_PIN, OUTPUT);
-  ledcSetup(BUZZER_CH, BUZZER_FREQ, BUZZER_RES);  // Setup PWM channel
-  ledcAttachPin(BUZZER_PIN, BUZZER_CH);           // Attach pin to PWM channel
-  ledcWriteTone(BUZZER_CH, 0);                    // Start with buzzer off
+  ledcAttach(BUZZER_PIN, BUZZER_FREQ, BUZZER_RES);  // Setup PWM channel and attach pin
+  ledcWriteTone(BUZZER_PIN, 0);                     // Start with buzzer off
 
   // === Lamps Setup ===
   // Configure LED lamp outputs
@@ -397,9 +395,9 @@ void runLineFollow() {
 // CALLED BY: handleClient() when /buzzer endpoint is requested
 // Plays a test beep sound for 300ms using PWM tone generation
 void BuzzerTest() {
-  ledcWriteTone(BUZZER_CH, BUZZER_FREQ);  // Turn on buzzer at 2000 Hz
-  delay(300);                              // Hold tone for 300ms (blocking)
-  ledcWriteTone(BUZZER_CH, 0);            // Turn off buzzer
+  ledcWriteTone(BUZZER_PIN, BUZZER_FREQ);  // Turn on buzzer at 2000 Hz
+  delay(300);                               // Hold tone for 300ms (blocking)
+  ledcWriteTone(BUZZER_PIN, 0);             // Turn off buzzer
 }
 
 // CALLED BY: (Legacy function, not currently used in code)
@@ -452,14 +450,14 @@ void startSiren() {
   sirenEndMs = millis() + SIREN_DURATION_MS; // Set end time (2 seconds from now)
   sirenLastToggleMs = 0;                     // Reset lamp toggle timer
   sirenLastFreqMs = 0;                       // Reset frequency change timer
-  ledcWriteTone(BUZZER_CH, sirenFreq);       // Start buzzer tone
+  ledcWriteTone(BUZZER_PIN, sirenFreq);      // Start buzzer tone
 }
 
 // CALLED BY: updateSiren() when siren duration expires, or SirenAlarm() to turn off
 // Stops siren sound and turns off all lamps
 void stopSiren() {
   sirenActive = false;              // Disable siren state
-  ledcWriteTone(BUZZER_CH, 0);      // Turn off buzzer
+  ledcWriteTone(BUZZER_PIN, 0);     // Turn off buzzer
   digitalWrite(FRONTLAMPS, LOW);    // Turn off front lamps
   digitalWrite(REARLAMPS, LOW);     // Turn off rear lamps
 }
@@ -509,7 +507,7 @@ void updateSiren() {
         sirenIncreasing = true;      // Start going up
       }
     }
-    ledcWriteTone(BUZZER_CH, sirenFreq);  // Update buzzer frequency
+    ledcWriteTone(BUZZER_PIN, sirenFreq);  // Update buzzer frequency
   }
 }
 
