@@ -1,8 +1,9 @@
-#include <WiFi.h>
+// Simple ESP32 sketch with HTTP control interface + SN754410 Motor Driver
+#define FRONTLAMPS 2
+#define REARLAMPS 0
+#define BUZZER_PIN 21
 
-// ============================================================================
-// MOTOR DRIVER MODULE (SN754410)
-// ============================================================================
+// SN754410 Motor Driver pins
 #define LEFT_EN 25     // PWM enable (speed control)
 #define LEFT_IN1 16    // Left motor input 1
 #define LEFT_IN2 17    // Left motor input 2
@@ -11,234 +12,153 @@
 #define RIGHT_IN1 18   // Right motor input 1
 #define RIGHT_IN2 19   // Right motor input 2
 
-// Virtual Joystick variables (controlled via web interface)
-int joystickX = 0;  // -100 to 100
-int joystickY = 0;  // -100 to 100
-bool joystickMode = true;  // Enable joystick control by default
-
-// Motor speed smoothing variables for gradual acceleration/deceleration
-int currentLeftSpeed = 0;   // Current left motor speed
-int currentRightSpeed = 0;  // Current right motor speed
-int targetLeftSpeed = 0;    // Target left motor speed
-int targetRightSpeed = 0;   // Target right motor speed
-const int ACCEL_RATE = 15;  // Speed change per update cycle (higher = faster response)
-
-// ============================================================================
-// ENCODER MODULE
-// ============================================================================
+// Encoder pins
 #define LEFT_ENC_A 34  // Left motor encoder A
 #define LEFT_ENC_B 35  // Left motor encoder B
 #define RIGHT_ENC_A 36 // Right motor encoder A
 #define RIGHT_ENC_B 39 // Right motor encoder B
 
-volatile int leftEncoderCount = 0;  // Tracks left wheel rotation, displayed on web interface
-volatile int rightEncoderCount = 0; // Tracks right wheel rotation, displayed on web interface
+// Encoder counters
+volatile int leftEncoderCount = 0;
+volatile int rightEncoderCount = 0;
 
-// Encoder interrupt handlers - CALLED BY: Hardware interrupts (attached in setup())
-// These functions are triggered automatically when encoder signals change
-// They update the encoder counts which are displayed on the web interface
+#include <WiFi.h>
+
+// Buzzer PWM (LEDC) settings
+const int BUZZER_CH = 0;
+const int BUZZER_FREQ = 2000; // 2 kHz default tone
+const int BUZZER_RES = 8;     // 8-bit resolution (0-255)
+
+// Line-following sensors (analog)
+#define SENSOR_LEFT_PIN 32
+#define SENSOR_RIGHT_PIN 33
+
+// Ultrasonic sensor pins
+#define TRIG_PIN 4
+#define ECHO_PIN 27
+const int OBSTACLE_DISTANCE_CM = 5;  // Stop if object closer than this
+
+// ADC and line-follow parameters
+const int READ_INTERVAL_MS = 100;
+const int AVG_SAMPLES = 6;
+const int BLACK_THRESHOLD = 3800;
+const int UPDATE_INTERVAL = 20;
+const int LINE_SWEEP_SPEED = 180;
+// Ultrasonic sampling
+const int ULTRASONIC_SAMPLES = 3;
+const bool ULTRASONIC_DEBUG = true;
+int thresholdLeft = 2000;
+int thresholdRight = 2000;
+long sensorLeft = 0;
+long sensorRight = 0;
+bool lineFollowing = false;
+unsigned long lastLineRead = 0;
+unsigned long lastLineFollowUpdate = 0;
+long distanceCm = 0;
+
+// Virtual Joystick variables (controlled via web interface)
+int joystickX = 0;  // -100 to 100
+int joystickY = 0;  // -100 to 100
+bool joystickMode = true;  // Joystick control ON by default
+
+// Access Point settings
+const char* ap_ssid = "Mater";
+const char* ap_pass = "cars808";
+
+WiFiServer server(80);
+
+// Encoder interrupt handlers
 void IRAM_ATTR handleLeftEncoderA() {
-  // Determine rotation direction by comparing encoder phases
   if (digitalRead(LEFT_ENC_A) == digitalRead(LEFT_ENC_B)) {
-    leftEncoderCount++;  // Forward rotation
+    leftEncoderCount++;
   } else {
-    leftEncoderCount--;  // Backward rotation
+    leftEncoderCount--;
   }
 }
 
 void IRAM_ATTR handleRightEncoderA() {
-  // Determine rotation direction by comparing encoder phases
   if (digitalRead(RIGHT_ENC_A) == digitalRead(RIGHT_ENC_B)) {
-    rightEncoderCount++;  // Forward rotation
+    rightEncoderCount++;
   } else {
-    rightEncoderCount--;  // Backward rotation
+    rightEncoderCount--;
   }
 }
 
-// ============================================================================
-// LINE FOLLOWING MODULE (PHOTOTRANSISTOR)
-// ============================================================================
-#define PHOTOTRANSISTOR_PIN 32
-const int BLACK_THRESHOLD = 3800;  // Threshold for detecting black line
-const int UPDATE_INTERVAL = 20;
-long sensorReading = 0;
-bool lineFollowing = false;
-unsigned long lastUpdate = 0;
-
-// Line following state machine variables (for non-blocking sweep)
-int sweepDuration = 7;          // Current sweep duration in ms
-bool sweepingLeft = true;       // Current sweep direction
-unsigned long sweepStartTime = 0;  // When current sweep began
-bool inSweep = false;           // Whether we're currently sweeping
-
-// ============================================================================
-// ULTRASONIC SENSOR MODULE
-// ============================================================================
-#define TRIG_PIN 4
-#define ECHO_PIN 27
-const int OBSTACLE_DISTANCE_CM = 5;  // Stop if object closer than this
-const int ULTRASONIC_SAMPLES = 3;
-const bool ULTRASONIC_DEBUG = true;
-long distanceCm = 0;
-
-// ============================================================================
-// BUZZER MODULE
-// ============================================================================
-#define BUZZER_PIN 21
-const int BUZZER_FREQ = 2000; // 2 kHz default tone
-const int BUZZER_RES = 8;     // 8-bit resolution (0-255)
-
-// Non-blocking buzzer state tracking
-bool buzzerActive = false;
-unsigned long buzzerEndTime = 0;
-const unsigned long BUZZER_DURATION_MS = 300;
-
-// ============================================================================
-// LAMPS MODULE
-// ============================================================================
-#define FRONTLAMPS 2
-#define REARLAMPS 0
-
-// Non-blocking lamp state tracking
-bool frontLampActive = false;
-unsigned long frontLampEndTime = 0;
-bool rearLampActive = false;
-unsigned long rearLampEndTime = 0;
-const unsigned long LAMP_DURATION_MS = 1000;
-
-// ============================================================================
-// SIREN MODULE
-// ============================================================================
-const int SIREN_MIN_FREQ = 300;
-const int SIREN_MAX_FREQ = 600;
-const int SIREN_FREQ_STEP = 30;
-const unsigned long SIREN_DURATION_MS = 2000;
-const unsigned long SIREN_LAMP_INTERVAL_MS = 80;
-const unsigned long SIREN_FREQ_INTERVAL_MS = 80;
-bool sirenActive = false;
-bool sirenLampFront = true;
-bool sirenIncreasing = true;
-int sirenFreq = SIREN_MIN_FREQ;
-unsigned long sirenEndMs = 0;
-unsigned long sirenLastToggleMs = 0;
-unsigned long sirenLastFreqMs = 0;
-
-// ============================================================================
-// WIFI & WEB SERVER MODULE
-// ============================================================================
-const char* ap_ssid = "JohnDeere";
-const char* ap_pass = "tractor808";
-WiFiServer server(80);
-
-// ============================================================================
-// GENERAL TIMING
-// ============================================================================
-const int READ_INTERVAL_MS = 20;  // Read sensors every 20ms (faster updates)
-const int AVG_SAMPLES = 1;  // Single sample for instant response
-unsigned long lastLineRead = 0;
-
-// ============================================================================
-// SETUP FUNCTION - CALLED ONCE: At ESP32 startup/reset
-// ============================================================================
 void setup() {
-  Serial.begin(115200);  // Initialize serial communication for debugging
-  delay(1000);           // Wait for serial to stabilize
+  Serial.begin(115200);
+  delay(1000);
   
-  // === Motor Driver Setup ===
-  // Configure pins for SN754410 motor driver
-  // These pins control motor speed and direction
-  // USED BY: motorForward(), motorBackward(), motorStop(), motorLeft(), motorRight(),
-  //          handleJoystickControl(), forward(), left(), right(), stop()
-  pinMode(LEFT_EN, OUTPUT);   // Left motor speed control (PWM)
-  pinMode(LEFT_IN1, OUTPUT);  // Left motor direction bit 1
-  pinMode(LEFT_IN2, OUTPUT);  // Left motor direction bit 2
-  pinMode(RIGHT_EN, OUTPUT);  // Right motor speed control (PWM)
-  pinMode(RIGHT_IN1, OUTPUT); // Right motor direction bit 1
-  pinMode(RIGHT_IN2, OUTPUT); // Right motor direction bit 2
+  Serial.println("\n\n=== ESP32 LED & Horn Control with Motors ===");
+  
+  // Start Access Point (no external network connection needed)
+  WiFi.mode(WIFI_AP); // AP only mode
+  Serial.println("\nStarting Access Point...");
+  WiFi.softAP(ap_ssid, ap_pass);
+  Serial.print("AP SSID: ");
+  Serial.println(ap_ssid);
+  Serial.print("AP IP: ");
+  Serial.println(WiFi.softAPIP());
 
-  // === Encoder Setup ===
-  // Configure encoder pins as inputs to track wheel rotation
-  // Attach interrupt handlers that automatically trigger on encoder signal changes
-  // INTERRUPTS CALL: handleLeftEncoderA(), handleRightEncoderA()
+  server.begin();
+  Serial.println("\nWeb server started on port 80");
+  // ADC setup for line sensors
+  analogReadResolution(12);
+  analogSetPinAttenuation(SENSOR_LEFT_PIN, ADC_11db);
+  analogSetPinAttenuation(SENSOR_RIGHT_PIN, ADC_11db);
+  Serial.println("Line sensors initialized");
+  
+  // Ultrasonic sensor setup
+  pinMode(TRIG_PIN, OUTPUT);
+  pinMode(ECHO_PIN, INPUT);
+  Serial.println("Ultrasonic sensor initialized");
+  // Initialize buzzer PWM (LEDC)
+  // Use simple digital pin for buzzer (manual tone generator used)
+  // Motor control pins as outputs
+  pinMode(LEFT_EN, OUTPUT);
+  pinMode(LEFT_IN1, OUTPUT);
+  pinMode(LEFT_IN2, OUTPUT);
+  pinMode(RIGHT_EN, OUTPUT);
+  pinMode(RIGHT_IN1, OUTPUT);
+  pinMode(RIGHT_IN2, OUTPUT);
+  pinMode(BUZZER_PIN, OUTPUT);
+
+  // Encoder pins as inputs
   pinMode(LEFT_ENC_A, INPUT);
   pinMode(LEFT_ENC_B, INPUT);
   pinMode(RIGHT_ENC_A, INPUT);
   pinMode(RIGHT_ENC_B, INPUT);
+  
+  // Attach encoder interrupts
   attachInterrupt(digitalPinToInterrupt(LEFT_ENC_A), handleLeftEncoderA, CHANGE);
   attachInterrupt(digitalPinToInterrupt(RIGHT_ENC_A), handleRightEncoderA, CHANGE);
+  Serial.println("Encoders initialized");
 
-  // === Line Following Sensor Setup ===
-  // Configure ADC for phototransistor analog reading
-  // USED BY: seesBlack() which reads PHOTOTRANSISTOR_PIN
-  analogReadResolution(12);  // 12-bit resolution (0-4095)
-  analogSetPinAttenuation(PHOTOTRANSISTOR_PIN, ADC_11db);  // Full voltage range
-  
-  // === Ultrasonic Sensor Setup ===
-  // Configure pins for HC-SR04 distance sensor
-  // USED BY: readUltrasonicDistance() called in loop()
-  pinMode(TRIG_PIN, OUTPUT);  // Trigger pin sends ultrasonic pulse
-  pinMode(ECHO_PIN, INPUT);   // Echo pin receives reflected pulse
-
-  // === Buzzer Setup ===
-  // Configure PWM (LEDC) for buzzer tone generation
-  // USED BY: BuzzerTest(), playTone(), startSiren(), stopSiren(), updateSiren()
-  pinMode(BUZZER_PIN, OUTPUT);
-  ledcAttach(BUZZER_PIN, BUZZER_FREQ, BUZZER_RES);  // Setup PWM channel and attach pin
-  ledcWriteTone(BUZZER_PIN, 0);                     // Start with buzzer off
-
-  // === Lamps Setup ===
-  // Configure LED lamp outputs
-  // USED BY: FrontLampTest(), RearLampTest(), updateSiren(), stopSiren()
   pinMode(FRONTLAMPS, OUTPUT);
   pinMode(REARLAMPS, OUTPUT);
-
-  // === WiFi & Web Server Setup ===
-  // Start WiFi Access Point and web server for remote control
-  // USED BY: handleClient() processes incoming web requests in loop()
-  WiFi.mode(WIFI_AP);              // Set to Access Point mode (no router needed)
-  WiFi.softAP(ap_ssid, ap_pass);   // Create AP with SSID "JohnDeere"
-  server.begin();                  // Start web server on port 80
 }
 
-// ============================================================================
-// UTILITY FUNCTIONS
-// ============================================================================
-
-// CALLED BY: handleClient() - Sends HTTP response to web browser
-// Formats and sends HTML content as HTTP 200 OK response
 void sendHttpResponse(WiFiClient &client, const String &body) {
-  client.println("HTTP/1.1 200 OK");        // HTTP status code
-  client.println("Content-Type: text/html"); // Tell browser it's HTML
-  client.println("Connection: close");       // Close connection after response
-  client.println();                          // Empty line separates headers from body
-  client.println(body);                      // Send HTML content
+  client.println("HTTP/1.1 200 OK");
+  client.println("Content-Type: text/html");
+  client.println("Connection: close");
+  client.println();
+  client.println(body);
 }
 
-// CALLED BY: readUltrasonicDistance(), loop() (legacy) - Averages multiple analog readings
-// Takes multiple sensor samples and returns the average to reduce noise (non-blocking version)
 long readAverage(int pin, int samples) {
   long sum = 0;
   for (int i = 0; i < samples; ++i) {
-    sum += analogRead(pin);  // Read analog value
-    // Removed delay - readings happen immediately
+    sum += analogRead(pin);
+    delay(2);
   }
-  return sum / samples;      // Return average
+  return sum / samples;
 }
 
-// ============================================================================
-// ULTRASONIC SENSOR FUNCTIONS
-// ============================================================================
-
-// CALLED BY: loop() - Measures distance to obstacles using HC-SR04 sensor
-// Returns: Distance in centimeters, or 0 if no valid reading
-// Uses multiple samples (ULTRASONIC_SAMPLES) and averages them for accuracy (non-blocking)
+// Read ultrasonic distance in cm
 long readUltrasonicDistance() {
-  long totalDistance = 0;  // Accumulator for valid distance readings
-  int valid = 0;           // Count of successful readings
-  
-  // Take multiple samples and average them
+  long totalDistance = 0;
+  int valid = 0;
   for (int s = 0; s < ULTRASONIC_SAMPLES; ++s) {
-    // Send ultrasonic pulse (10μs HIGH pulse)
     digitalWrite(TRIG_PIN, LOW);
     delayMicroseconds(2);
     digitalWrite(TRIG_PIN, HIGH);
@@ -246,6 +166,9 @@ long readUltrasonicDistance() {
     digitalWrite(TRIG_PIN, LOW);
 
     long duration = pulseIn(ECHO_PIN, HIGH, 30000);  // 30ms timeout
+    if (ULTRASONIC_DEBUG) {
+      Serial.print("Ultrasonic raw duration: "); Serial.println(duration);
+    }
     if (duration > 0) {
       // distance = (duration in microseconds * speed of sound) / 2
       // speed of sound = 343 m/s = 0.0343 cm/microsecond
@@ -253,159 +176,93 @@ long readUltrasonicDistance() {
       totalDistance += distance;
       valid++;
     }
-    // Removed delay between samples - measurements happen immediately
+    delay(10);
   }
 
   if (valid == 0) {
+    if (ULTRASONIC_DEBUG) Serial.println("Ultrasonic: timeout / no echo");
     return 0;
   }
 
   long avg = totalDistance / valid;
+  if (ULTRASONIC_DEBUG) {
+    Serial.print("Ultrasonic distance (cm) avg: "); Serial.println(avg);
+  }
   return avg;
 }
 
-// ============================================================================
-// LINE FOLLOWING FUNCTIONS
-// ============================================================================
-
-// CALLED BY: runLineFollow() - Checks if phototransistor detects black line
-// Returns: true if sensor reading is above BLACK_THRESHOLD (on black line)
-//          false if sensor reading is below BLACK_THRESHOLD (off line)
 bool seesBlack() {
-  return analogRead(PHOTOTRANSISTOR_PIN) > BLACK_THRESHOLD;
+  return analogRead(SENSOR_LEFT_PIN) > BLACK_THRESHOLD;
 }
 
-// Motor control helper functions for line following
-// CALLED BY: runLineFollow() during line following behavior
-
-// Move both motors forward at speed 200
-void forward() {
-  digitalWrite(LEFT_IN1, HIGH);   // Left motor forward
-  digitalWrite(LEFT_IN2, LOW);
-  analogWrite(LEFT_EN, 200);      // Left motor speed
-  
-  digitalWrite(RIGHT_IN1, HIGH);  // Right motor forward
-  digitalWrite(RIGHT_IN2, LOW);
-  analogWrite(RIGHT_EN, 200);     // Right motor speed
-}
-
-// Turn left by stopping left motor, running right motor forward
-void left() {
-  digitalWrite(LEFT_IN1, LOW);    // Left motor stopped
-  digitalWrite(LEFT_IN2, LOW);
-  analogWrite(LEFT_EN, 0);        // Left motor speed = 0
-  
-  digitalWrite(RIGHT_IN1, HIGH);  // Right motor forward
-  digitalWrite(RIGHT_IN2, LOW);
-  analogWrite(RIGHT_EN, 200);     // Right motor speed = 200
-}
-
-// Turn right by running left motor forward, stopping right motor
-void right() {
-  digitalWrite(LEFT_IN1, HIGH);   // Left motor forward
-  digitalWrite(LEFT_IN2, LOW);
-  analogWrite(LEFT_EN, 200);      // Left motor speed = 200
-  
-  digitalWrite(RIGHT_IN1, LOW);   // Right motor stopped
-  digitalWrite(RIGHT_IN2, LOW);
-  analogWrite(RIGHT_EN, 0);       // Right motor speed = 0
-}
-
-// Stop both motors completely
-void stop() {
-  digitalWrite(LEFT_IN1, LOW);    // Left motor stopped
-  digitalWrite(LEFT_IN2, LOW);
-  analogWrite(LEFT_EN, 0);        // Left motor speed = 0
-  
-  digitalWrite(RIGHT_IN1, LOW);   // Right motor stopped
-  digitalWrite(RIGHT_IN2, LOW);
-  analogWrite(RIGHT_EN, 0);       // Right motor speed = 0
-}
-
-// CALLED BY: loop() when lineFollowing == true
-// Main line following algorithm with expanding sweep pattern (NON-BLOCKING)
-// Uses state machine to avoid blocking delays
-// CALLS: seesBlack(), forward(), left(), right(), stop()
+// Line-follow logic from provided module:
+// - If on line: drive forward
+// - If line lost: sweep left/right with increasing sweep duration until line is found
 void runLineFollow() {
   unsigned long now = millis();
-  // Rate limiting: Only run line follow logic every UPDATE_INTERVAL ms
-  if (now - lastUpdate < UPDATE_INTERVAL) return;
-  lastUpdate = now;
+  if (now - lastLineFollowUpdate < UPDATE_INTERVAL) return;
+  lastLineFollowUpdate = now;
 
-  // CALLS: seesBlack() to check sensor
-  // If on the line, just go forward
+  // Keep sensor values updated for UI
+  sensorLeft = readAverage(SENSOR_LEFT_PIN, AVG_SAMPLES);
+  sensorRight = readAverage(SENSOR_RIGHT_PIN, AVG_SAMPLES);
+
   if (seesBlack()) {
-    forward();  // CALLS: forward() to move straight
-    inSweep = false;
+    motorForward(200);
     return;
   }
 
-  // Line lost - use state machine for non-blocking sweep
-  if (!inSweep) {
-    // Start new sweep
-    inSweep = true;
-    sweepStartTime = now;
-  }
-
-  unsigned long sweepElapsed = now - sweepStartTime;
-
-  // Check if current sweep is complete
-  if (sweepElapsed >= sweepDuration) {
-    // Sweep finished, check if we found the line
-    if (seesBlack()) {
-      forward();  // CALLS: forward() if line found
-      inSweep = false;
-      return;
+  int sweep = 7;
+  bool goingLeft = true;
+  while (!seesBlack()) {
+    if (goingLeft) {
+      pivotLeftInPlace(LINE_SWEEP_SPEED);
+      delay(sweep);
+      goingLeft = false;
+      if (seesBlack()) {
+        pivotLeftInPlace(LINE_SWEEP_SPEED);
+        delay(3);
+      }
+    } else {
+      pivotRightInPlace(LINE_SWEEP_SPEED);
+      delay(sweep);
+      goingLeft = true;
+      if (seesBlack()) {
+        pivotRightInPlace(LINE_SWEEP_SPEED);
+        delay(3);
+      }
     }
-    
-    // Line not found during sweep - alternate direction and expand sweep duration
-    sweepingLeft = !sweepingLeft;
-    sweepDuration += 7;  // Expand sweep by 7ms
-    
-    // Safety limit: if sweep gets too large, stop searching
-    if (sweepDuration > 100) {
-      stop();  // CALLS: stop() if sweep exceeds 100ms
-      inSweep = false;
-      return;
+
+    if (!seesBlack()) {
+      if (goingLeft) {
+        pivotLeftInPlace(LINE_SWEEP_SPEED);
+        delay(sweep);
+      } else {
+        pivotRightInPlace(LINE_SWEEP_SPEED);
+        delay(sweep);
+      }
     }
-    
-    // Start next sweep
-    sweepStartTime = now;
+    sweep += 7;
   }
 
-  // Apply current sweep direction
-  if (sweepingLeft) {
-    left();   // CALLS: left() - turn left
-  } else {
-    right();  // CALLS: right() - turn right
+  if (seesBlack()) {
+    motorForward(200);
+    return;
   }
+
+  motorStop();
 }
 
-// ============================================================================
-// BUZZER FUNCTIONS
-// ============================================================================
-
-// CALLED BY: handleClient() when /buzzer endpoint is requested
-// Starts a non-blocking buzzer beep (300ms duration)
 void BuzzerTest() {
-  buzzerActive = true;
-  buzzerEndTime = millis() + BUZZER_DURATION_MS;  // Set end time
-  ledcWriteTone(BUZZER_PIN, BUZZER_FREQ);  // Turn on buzzer
+  // Play two short tones for an audible beep using manual toggling
+  Serial.println("Buzzer Test - ON");
+  playTone(BUZZER_PIN, BUZZER_FREQ, 300);
+  delay(150);
+  playTone(BUZZER_PIN, BUZZER_FREQ, 300);
+  Serial.println("Buzzer Test Complete");
 }
 
-// CALLED BY: loop() every iteration - Updates buzzer (non-blocking)
-void updateBuzzer() {
-  if (!buzzerActive) return;  // Exit if buzzer is off
-  
-  if (millis() >= buzzerEndTime) {
-    buzzerActive = false;
-    ledcWriteTone(BUZZER_PIN, 0);  // Turn off buzzer
-  }
-}
-
-// CALLED BY: (Legacy function, not currently used in code)
-// Simple blocking tone generator using digital toggling
-// Alternative to PWM when LEDC is not available
+// Simple blocking tone generator using digital toggling (works when LEDC not available)
 void playTone(int pin, int freq, int duration_ms) {
   if (freq <= 0 || duration_ms <= 0) return;
   unsigned long period_us = 1000000UL / (unsigned long)freq;
@@ -419,791 +276,377 @@ void playTone(int pin, int freq, int duration_ms) {
   }
 }
 
-// ============================================================================
-// LAMPS FUNCTIONS
-// ============================================================================
-
-// CALLED BY: handleClient() when /front endpoint is requested
-// Starts non-blocking front lamp effect (1 second duration)
 void FrontLampTest(){
-  frontLampActive = true;
-  frontLampEndTime = millis() + LAMP_DURATION_MS;  // Set end time
-  digitalWrite(FRONTLAMPS, HIGH);  // Turn on front lamps
+  Serial.println("Front Lamp Test");
+  digitalWrite(FRONTLAMPS, HIGH);
+  delay(1000);
+  digitalWrite(FRONTLAMPS, LOW);
 }
 
-// CALLED BY: handleClient() when /rear endpoint is requested
-// Starts non-blocking rear lamp effect (1 second duration)
 void RearLampTest(){
-  rearLampActive = true;
-  rearLampEndTime = millis() + LAMP_DURATION_MS;  // Set end time
-  digitalWrite(REARLAMPS, HIGH);   // Turn on rear lamps
+  Serial.println("Rear Lamp Test");
+  digitalWrite(REARLAMPS, HIGH);
+  delay(1000);
+  digitalWrite(REARLAMPS, LOW);
 }
 
-// CALLED BY: loop() every iteration - Updates lamps (non-blocking)
-void updateLamps() {
-  if (frontLampActive && millis() >= frontLampEndTime) {
-    frontLampActive = false;
-    digitalWrite(FRONTLAMPS, LOW);  // Turn off front lamps
-  }
-  
-  if (rearLampActive && millis() >= rearLampEndTime) {
-    rearLampActive = false;
-    digitalWrite(REARLAMPS, LOW);   // Turn off rear lamps
-  }
-}
-
-// ============================================================================
-// SIREN FUNCTIONS
-// ============================================================================
-
-// CALLED BY: SirenAlarm() when siren is turned on
-// Initializes siren state and starts the effect
-void startSiren() {
-  sirenActive = true;                        // Enable siren state
-  sirenLampFront = true;                     // Start with front lamps
-  sirenIncreasing = true;                    // Start frequency sweep going up
-  sirenFreq = SIREN_MIN_FREQ;                // Start at minimum frequency (300 Hz)
-  sirenEndMs = millis() + SIREN_DURATION_MS; // Set end time (2 seconds from now)
-  sirenLastToggleMs = 0;                     // Reset lamp toggle timer
-  sirenLastFreqMs = 0;                       // Reset frequency change timer
-  ledcWriteTone(BUZZER_PIN, sirenFreq);      // Start buzzer tone
-}
-
-// CALLED BY: updateSiren() when siren duration expires, or SirenAlarm() to turn off
-// Stops siren sound and turns off all lamps
-void stopSiren() {
-  sirenActive = false;              // Disable siren state
-  ledcWriteTone(BUZZER_PIN, 0);     // Turn off buzzer
-  digitalWrite(FRONTLAMPS, LOW);    // Turn off front lamps
-  digitalWrite(REARLAMPS, LOW);     // Turn off rear lamps
-}
-
-// CALLED BY: loop() every iteration to maintain non-blocking siren effect
-// Manages alternating lamps and sweeping frequency for siren effect
-// CALLS: stopSiren() when duration expires
-void updateSiren() {
-  if (!sirenActive) return;  // Exit if siren is not active
-
-  unsigned long now = millis();
-  
-  // Check if siren duration has expired
-  if (now >= sirenEndMs) {
-    stopSiren();  // CALLS: stopSiren() to turn off
-    return;
-  }
-
-  // Alternate front/rear lamps every SIREN_LAMP_INTERVAL_MS (80ms)
-  if (sirenLastToggleMs == 0 || now - sirenLastToggleMs >= SIREN_LAMP_INTERVAL_MS) {
-    sirenLastToggleMs = now;
-    if (sirenLampFront) {
-      digitalWrite(FRONTLAMPS, HIGH);  // Front on
-      digitalWrite(REARLAMPS, LOW);    // Rear off
-    } else {
-      digitalWrite(FRONTLAMPS, LOW);   // Front off
-      digitalWrite(REARLAMPS, HIGH);   // Rear on
-    }
-    sirenLampFront = !sirenLampFront;  // Toggle for next time
-  }
-
-  // Sweep buzzer frequency up and down every SIREN_FREQ_INTERVAL_MS (80ms)
-  if (sirenLastFreqMs == 0 || now - sirenLastFreqMs >= SIREN_FREQ_INTERVAL_MS) {
-    sirenLastFreqMs = now;
-    if (sirenIncreasing) {
-      // Frequency going up (300 Hz -> 600 Hz)
-      sirenFreq += SIREN_FREQ_STEP;  // Increase by 30 Hz
-      if (sirenFreq >= SIREN_MAX_FREQ) {
-        sirenFreq = SIREN_MAX_FREQ;
-        sirenIncreasing = false;     // Start going down
-      }
-    } else {
-      // Frequency going down (600 Hz -> 300 Hz)
-      sirenFreq -= SIREN_FREQ_STEP;  // Decrease by 30 Hz
-      if (sirenFreq <= SIREN_MIN_FREQ) {
-        sirenFreq = SIREN_MIN_FREQ;
-        sirenIncreasing = true;      // Start going up
-      }
-    }
-    ledcWriteTone(BUZZER_PIN, sirenFreq);  // Update buzzer frequency
-  }
-}
-
-// CALLED BY: handleClient() when /siren endpoint is requested
-// Toggles siren on/off
-// CALLS: startSiren() to turn on, stopSiren() to turn off
-void SirenAlarm() {
-  if (sirenActive) {
-    stopSiren();   // CALLS: stopSiren() if already active
-  } else {
-    startSiren();  // CALLS: startSiren() if currently off
-  }
-}
-
-// ============================================================================
-// MOTOR CONTROL FUNCTIONS
-// ============================================================================
-// These are high-level motor control functions
-// CALLED BY: handleClient() when web interface buttons are pressed
-
-// CALLED BY: handleClient() when /forward endpoint is requested
-// Moves robot forward at fixed speed
+// Motor control functions
 void motorForward(uint8_t speed) {
-  // Left motor forward (IN1=HIGH, IN2=LOW)
+  Serial.println("Motors Forward");
+
+  // Left motor forward
   digitalWrite(LEFT_IN1, HIGH);
   digitalWrite(LEFT_IN2, LOW);
-  digitalWrite(LEFT_EN, HIGH);  // Enable motor at full speed
+  digitalWrite(LEFT_EN, HIGH);
 
-  // Right motor forward (IN1=HIGH, IN2=LOW)
+  // Right motor forward
   digitalWrite(RIGHT_IN1, HIGH);
   digitalWrite(RIGHT_IN2, LOW);
-  digitalWrite(RIGHT_EN, HIGH);  // Enable motor at full speed
+  digitalWrite(RIGHT_EN, HIGH);
 }
 
-// CALLED BY: handleClient() when /backward endpoint is requested
-// Moves robot backward at fixed speed
 void motorBackward(uint8_t speed) {
-  // Left motor backward (IN1=LOW, IN2=HIGH)
+  Serial.println("Motors Backward");
+
+  // Left motor backward
   digitalWrite(LEFT_IN1, LOW);
   digitalWrite(LEFT_IN2, HIGH);
-  digitalWrite(LEFT_EN, HIGH);  // Enable motor at full speed
+  digitalWrite(LEFT_EN, HIGH);
 
-  // Right motor backward (IN1=LOW, IN2=HIGH)
+  // Right motor backward
   digitalWrite(RIGHT_IN1, LOW);
   digitalWrite(RIGHT_IN2, HIGH);
-  digitalWrite(RIGHT_EN, HIGH);  // Enable motor at full speed
+  digitalWrite(RIGHT_EN, HIGH);
 }
 
-// CALLED BY: handleClient() when /stop endpoint is requested, or loop() when obstacle detected
-// Stops both motors completely
 void motorStop() {
-  // Left motor stop (both inputs LOW, enable LOW)
+  Serial.println("Motors Stopped");
+  
+  // Left motor stop
   digitalWrite(LEFT_IN1, LOW);
   digitalWrite(LEFT_IN2, LOW);
   digitalWrite(LEFT_EN, LOW);
   
-  // Right motor stop (both inputs LOW, enable LOW)
+  // Right motor stop
   digitalWrite(RIGHT_IN1, LOW);
   digitalWrite(RIGHT_IN2, LOW);
   digitalWrite(RIGHT_EN, LOW);
 }
 
-// CALLED BY: handleClient() when /left endpoint is requested
-// Turns robot left (right motor only)
 void motorLeft(uint8_t speed) {
-  // Left motor stop
+  Serial.println("Turn Left");
+
+  // Left motor stop, right motor forward
   digitalWrite(LEFT_IN1, HIGH);
   digitalWrite(LEFT_IN2, LOW);
-  digitalWrite(LEFT_EN, LOW);    // Left motor disabled
+  digitalWrite(LEFT_EN, LOW);
 
-  // Right motor forward - creates left turn
   digitalWrite(RIGHT_IN1, HIGH);
   digitalWrite(RIGHT_IN2, LOW);
-  digitalWrite(RIGHT_EN, HIGH);  // Right motor at full speed
+  digitalWrite(RIGHT_EN, HIGH);
 }
 
-// CALLED BY: handleClient() when /right endpoint is requested
-// Turns robot right (left motor only)
 void motorRight(uint8_t speed) {
-  // Left motor forward - creates right turn
+  Serial.println("Turn Right");
+
+  // Left motor forward, right motor stop
   digitalWrite(LEFT_IN1, HIGH);
   digitalWrite(LEFT_IN2, LOW);
-  digitalWrite(LEFT_EN, HIGH);   // Left motor at full speed
+  digitalWrite(LEFT_EN, HIGH);
 
-  // Right motor stop
   digitalWrite(RIGHT_IN1, HIGH);
   digitalWrite(RIGHT_IN2, LOW);
-  digitalWrite(RIGHT_EN, LOW);   // Right motor disabled
+  digitalWrite(RIGHT_EN, LOW);
 }
 
-// CALLED BY: loop() when joystickMode is enabled
-// Maps virtual joystick X/Y values to differential motor speeds
-// Joystick control function - implements tank/differential drive with gradual turning
+void pivotLeftInPlace(uint8_t speed) {
+  digitalWrite(LEFT_IN1, LOW);
+  digitalWrite(LEFT_IN2, HIGH);
+  analogWrite(LEFT_EN, speed);
+
+  digitalWrite(RIGHT_IN1, HIGH);
+  digitalWrite(RIGHT_IN2, LOW);
+  analogWrite(RIGHT_EN, speed);
+}
+
+void pivotRightInPlace(uint8_t speed) {
+  digitalWrite(LEFT_IN1, HIGH);
+  digitalWrite(LEFT_IN2, LOW);
+  analogWrite(LEFT_EN, speed);
+
+  digitalWrite(RIGHT_IN1, LOW);
+  digitalWrite(RIGHT_IN2, HIGH);
+  analogWrite(RIGHT_EN, speed);
+}
+
+// Joystick control function - maps joystick values to motor speeds
 void handleJoystickControl(int joyX, int joyY) {
-  // INPUT: joyX and joyY are in range -100 to 100 from web interface
-  //   joyY: Forward/Backward (positive = forward, negative = backward)
-  //   joyX: Left/Right turning (positive = turn right, negative = turn left)
-  
-  // Deadzone to prevent drift from small joystick movements (5% threshold)
-  const int DEADZONE = 5;
-  if (abs(joyX) < DEADZONE) joyX = 0;
-  if (abs(joyY) < DEADZONE) joyY = 0;
-  
-  // Scale joystick inputs to motor PWM range (0-255)
-  // Using 2.55 multiplier to convert -100..100 range to -255..255
-  float scaledY = joyY * 2.55;
-  
-  // Reduce turning sensitivity for more gradual turns (50% of forward speed)
-  // This makes slight joystick movements produce gentle curves
-  float scaledX = joyX * 1.275;  // 50% turning rate (half of 2.55)
-  
-  // Calculate differential drive motor speeds
-  // Left motor: forward speed minus turning (turning right reduces left speed)
-  // Right motor: forward speed plus turning (turning right increases right speed)
-  targetLeftSpeed = (int)(scaledY - scaledX);
-  targetRightSpeed = (int)(scaledY + scaledX);
+  // joyX and joyY are in range -100 to 100 from web interface
+  // Map to full PWM range so joystick can command maximum motor speed
+  joyX = (int)(joyX * 2.55f);
+  joyY = (int)(joyY * 2.55f);
 
-  // Limit motor speeds to valid PWM range [-255, 255]
-  targetLeftSpeed = constrain(targetLeftSpeed, -255, 255);
-  targetRightSpeed = constrain(targetRightSpeed, -255, 255);
+  // Calculate motor speeds based on differential drive
+  // Forward/Backward: Y axis (positive = forward, negative = backward)
+  // Left/Right: X axis (positive = turn right, negative = turn left)
+  int leftMotorSpeed = joyY + joyX;
+  int rightMotorSpeed = joyY - joyX;
 
-  // Apply minimum speed threshold to overcome motor friction (25 PWM)
-  const int MIN_SPEED = 25;
-  if (abs(targetLeftSpeed) > 0 && abs(targetLeftSpeed) < MIN_SPEED) {
-    targetLeftSpeed = (targetLeftSpeed > 0) ? MIN_SPEED : -MIN_SPEED;
-  }
-  if (abs(targetRightSpeed) > 0 && abs(targetRightSpeed) < MIN_SPEED) {
-    targetRightSpeed = (targetRightSpeed > 0) ? MIN_SPEED : -MIN_SPEED;
-  }
+  // Limit motor speeds to [-255, 255]
+  leftMotorSpeed = constrain(leftMotorSpeed, -255, 255);
+  rightMotorSpeed = constrain(rightMotorSpeed, -255, 255);
 
-  // Smooth acceleration/deceleration - gradually move current speed toward target
-  // This prevents jerky movements by limiting speed changes per update cycle
-  if (currentLeftSpeed < targetLeftSpeed) {
-    currentLeftSpeed = min(currentLeftSpeed + ACCEL_RATE, targetLeftSpeed);
-  } else if (currentLeftSpeed > targetLeftSpeed) {
-    currentLeftSpeed = max(currentLeftSpeed - ACCEL_RATE, targetLeftSpeed);
-  }
-  
-  if (currentRightSpeed < targetRightSpeed) {
-    currentRightSpeed = min(currentRightSpeed + ACCEL_RATE, targetRightSpeed);
-  } else if (currentRightSpeed > targetRightSpeed) {
-    currentRightSpeed = max(currentRightSpeed - ACCEL_RATE, targetRightSpeed);
-  }
-
-  // Apply smoothed speeds to motors
-  if (currentLeftSpeed == 0 && currentRightSpeed == 0) {
-    motorStop();  // CALLS: motorStop() when both motors at zero
+  // Control motors based on speeds
+  if (leftMotorSpeed == 0 && rightMotorSpeed == 0) {
+    motorStop();
   } else {
     // Left motor
-    if (currentLeftSpeed > 0) {
+    if (leftMotorSpeed > 0) {
       digitalWrite(LEFT_IN1, HIGH);
       digitalWrite(LEFT_IN2, LOW);
-    } else if (currentLeftSpeed < 0) {
+    } else if (leftMotorSpeed < 0) {
       digitalWrite(LEFT_IN1, LOW);
       digitalWrite(LEFT_IN2, HIGH);
     } else {
       digitalWrite(LEFT_IN1, LOW);
       digitalWrite(LEFT_IN2, LOW);
     }
-    analogWrite(LEFT_EN, abs(currentLeftSpeed));
+    analogWrite(LEFT_EN, abs(leftMotorSpeed));
 
     // Right motor
-    if (currentRightSpeed > 0) {
+    if (rightMotorSpeed > 0) {
       digitalWrite(RIGHT_IN1, HIGH);
       digitalWrite(RIGHT_IN2, LOW);
-    } else if (currentRightSpeed < 0) {
+    } else if (rightMotorSpeed < 0) {
       digitalWrite(RIGHT_IN1, LOW);
       digitalWrite(RIGHT_IN2, HIGH);
     } else {
       digitalWrite(RIGHT_IN1, LOW);
       digitalWrite(RIGHT_IN2, LOW);
     }
-    analogWrite(RIGHT_EN, abs(currentRightSpeed));
+    analogWrite(RIGHT_EN, abs(rightMotorSpeed));
   }
 }
 
-// ============================================================================
-// WEB SERVER & CLIENT HANDLING
-// ============================================================================
-
-// CALLED BY: loop() when client connects to web server
-// Processes HTTP requests from web browser and calls appropriate functions
-// CALLS: Many functions based on URL endpoint requested
 void handleClient(WiFiClient client) {
-  if (!client) return;  // Exit if no valid client
+  if (!client) return;
 
-  String requestLine = "";   // First line of request (contains URL/endpoint)
-  
-  // Read only the first line of the HTTP request (non-blocking timeout)
-  unsigned long startTime = millis();
-  const int TIMEOUT_MS = 100;  // 100ms timeout for reading request
-  
-  while (client.available() && requestLine.indexOf('\n') == -1) {
-    if (millis() - startTime > TIMEOUT_MS) break;  // Timeout to prevent hanging
-    
-    char c = client.read();
-    if (c == '\n') {
-      break;  // Got complete first line
-    } else if (c != '\r') {
-      requestLine += c;  // Build first line character by character
+  String currentLine = "";
+  String requestLine = "";
+
+  while (client.connected()) {
+    if (client.available()) {
+      char c = client.read();
+      if (c == '\n') {
+        if (currentLine.length() == 0) {
+          break; // end of headers
+        }
+        if (requestLine.length() == 0) requestLine = currentLine;
+        currentLine = "";
+      } else if (c != '\r') {
+        currentLine += c;
+      }
     }
   }
-  
-  // Drain remaining data from client to clear the buffer
-  while (client.available()) {
-    client.read();
-  }
 
-  String responseBody = "";  // HTML response to send back to browser
+  String responseBody = "";
 
-  // ===== PARSE URL ENDPOINT AND CALL APPROPRIATE FUNCTIONS =====
-  
-  // ENDPOINT: /buzzer - Test buzzer sound
   if (requestLine.indexOf("GET /buzzer") == 0) {
-    BuzzerTest();  // CALLS: BuzzerTest() to play beep
+    BuzzerTest();
     responseBody = "<html><body><h1>Buzzer triggered</h1></body></html>";
-    
-  // ENDPOINT: /siren - Toggle siren effect
-  } else if (requestLine.indexOf("GET /siren") == 0) {
-    SirenAlarm();  // CALLS: SirenAlarm() which calls startSiren() or stopSiren()
-    responseBody = "<html><body><h1>Siren activated</h1></body></html>";
-    
-  // ENDPOINT: /front - Test front lamps
   } else if (requestLine.indexOf("GET /front") == 0) {
-    FrontLampTest();  // CALLS: FrontLampTest() to blink front lamps
+    FrontLampTest();
     responseBody = "<html><body><h1>Front lamp toggled</h1></body></html>";
-    
-  // ENDPOINT: /rear - Test rear lamps
   } else if (requestLine.indexOf("GET /rear") == 0) {
-    RearLampTest();  // CALLS: RearLampTest() to blink rear lamps
+    RearLampTest();
     responseBody = "<html><body><h1>Rear lamp toggled</h1></body></html>";
-    
-  // ENDPOINT: /forward - Move robot forward
   } else if (requestLine.indexOf("GET /forward") == 0) {
-    motorForward(200);  // CALLS: motorForward() to move forward
+    motorForward(200);
     responseBody = "<html><body><h1>Motors Forward</h1></body></html>";
-    
-  // ENDPOINT: /backward - Move robot backward
   } else if (requestLine.indexOf("GET /backward") == 0) {
-    motorBackward(200);  // CALLS: motorBackward() to move backward
+    motorBackward(200);
     responseBody = "<html><body><h1>Motors Backward</h1></body></html>";
-    
-  // ENDPOINT: /left - Turn robot left
   } else if (requestLine.indexOf("GET /left") == 0) {
-    motorLeft(200);  // CALLS: motorLeft() to turn left
+    motorRight(200);
     responseBody = "<html><body><h1>Turn Left</h1></body></html>";
-    
-  // ENDPOINT: /right - Turn robot right
   } else if (requestLine.indexOf("GET /right") == 0) {
-    motorRight(200);  // CALLS: motorRight() to turn right
+    motorLeft(200);
     responseBody = "<html><body><h1>Turn Right</h1></body></html>";
-    
-  // ENDPOINT: /stop - Stop all motors
   } else if (requestLine.indexOf("GET /stop") == 0) {
-    motorStop();  // CALLS: motorStop() to halt motors
+    motorStop();
     responseBody = "<html><body><h1>Motors Stopped</h1></body></html>";
-    
-  // ENDPOINT: /linefollow/start - Enable line following mode
   } else if (requestLine.indexOf("GET /linefollow/start") == 0) {
-    lineFollowing = true;   // Set flag, loop() will call runLineFollow()
-    joystickMode = false;   // Disable joystick when line following starts
-    // Reset smoothing variables
-    currentLeftSpeed = 0;
-    currentRightSpeed = 0;
-    targetLeftSpeed = 0;
-    targetRightSpeed = 0;
-    // Reset sweep state variables
-    sweepDuration = 7;
-    sweepingLeft = true;
-    inSweep = false;
+    lineFollowing = true;
+    joystickMode = false;
     responseBody = "<html><body><h1>Line follow started</h1></body></html>";
-    
-  // ENDPOINT: /linefollow/stop - Disable line following mode
   } else if (requestLine.indexOf("GET /linefollow/stop") == 0) {
-    lineFollowing = false;  // Clear flag, loop() stops calling runLineFollow()
-    joystickMode = true;    // Re-enable joystick mode
-    // Ensure both motors are fully reset
-    digitalWrite(LEFT_IN1, LOW);
-    digitalWrite(LEFT_IN2, LOW);
-    digitalWrite(LEFT_EN, LOW);
-    digitalWrite(RIGHT_IN1, LOW);
-    digitalWrite(RIGHT_IN2, LOW);
-    digitalWrite(RIGHT_EN, LOW);
-    // Reset smoothing variables
-    currentLeftSpeed = 0;
-    currentRightSpeed = 0;
-    targetLeftSpeed = 0;
-    targetRightSpeed = 0;
-    // Reset sweep state variables
-    sweepDuration = 7;
-    sweepingLeft = true;
-    inSweep = false;
+    lineFollowing = false;
+    joystickMode = true;
+    motorStop();
     responseBody = "<html><body><h1>Line follow stopped</h1></body></html>";
-    
-  // ENDPOINT: /linefollow/toggle - Toggle line following on/off
   } else if (requestLine.indexOf("GET /linefollow/toggle") == 0) {
-    lineFollowing = !lineFollowing;  // Toggle the flag
-    joystickMode = !lineFollowing;   // Joystick mode opposite of line following
-    if (!lineFollowing) {
-      // Ensure both motors are fully reset when stopping
-      digitalWrite(LEFT_IN1, LOW);
-      digitalWrite(LEFT_IN2, LOW);
-      digitalWrite(LEFT_EN, LOW);
-      digitalWrite(RIGHT_IN1, LOW);
-      digitalWrite(RIGHT_IN2, LOW);
-      digitalWrite(RIGHT_EN, LOW);
-    }
-    // Reset smoothing variables
-    currentLeftSpeed = 0;
-    currentRightSpeed = 0;
-    targetLeftSpeed = 0;
-    targetRightSpeed = 0;
-    // Reset sweep state variables
-    sweepDuration = 7;
-    sweepingLeft = true;
-    inSweep = false;
+    lineFollowing = !lineFollowing;
+    joystickMode = !lineFollowing;
+    if (!lineFollowing) motorStop();
     responseBody = String("<html><body><h1>Line follow ") + (lineFollowing ? "started" : "stopped") + "</h1></body></html>";
-    
-  // ENDPOINT: /linefollow/status - Get current sensor reading and state
   } else if (requestLine.indexOf("GET /linefollow/status") == 0) {
-    responseBody = String("<html><body><h1>Line Status</h1><p>Sensor=") + String(sensorReading) + "</p><p>State=" + (lineFollowing ? "ON" : "OFF") + "</p></body></html>";
-    
-  // ENDPOINT: /status - Get all status values as JSON for dynamic updates
-  } else if (requestLine.indexOf("GET /status") == 0) {
-    // Send JSON response directly with minimal overhead
-    client.println("HTTP/1.1 200 OK");
-    client.println("Content-Type: application/json");
-    client.println("Connection: close");
-    client.println();
-    
-    // Build and send JSON in one go
-    client.print("{\"sensor\":");
-    client.print(sensorReading);
-    client.print(",\"lineFollowing\":");
-    client.print(lineFollowing ? "true" : "false");
-    client.print(",\"joystickMode\":");
-    client.print(joystickMode ? "true" : "false");
-    client.print(",\"distanceCm\":");
-    client.print(distanceCm);
-    client.print(",\"leftEncoder\":");
-    client.print(leftEncoderCount);
-    client.print(",\"rightEncoder\":");
-    client.println(rightEncoderCount);
-    client.println("}");
-    
-    client.stop();
-    return;
-    
-  // ENDPOINT: /joystick/toggle - Toggle joystick control mode
+    responseBody = String("<html><body><h1>Line Status</h1><p>Left=") + String(sensorLeft) + " Right=" + String(sensorRight) + "</p><p>State=" + (lineFollowing ? "ON" : "OFF") + "</p></body></html>";
   } else if (requestLine.indexOf("GET /joystick/toggle") == 0) {
-    joystickMode = !joystickMode;    // Toggle joystick mode flag
-    if (!joystickMode) motorStop();  // CALLS: motorStop() when disabling
+    joystickMode = !joystickMode;
+    if (joystickMode) {
+      lineFollowing = false;
+    }
+    if (!joystickMode) motorStop();
     responseBody = String("<html><body><h1>Joystick Control ") + (joystickMode ? "Enabled" : "Disabled") + "</h1></body></html>";
-    
-  // ENDPOINT: /joystick/move?x=___&y=___ - Update joystick position
-  // Called continuously by web interface JavaScript to send joystick values
-  // These values are used by handleJoystickControl() in loop()
   } else if (requestLine.indexOf("GET /joystick/move?x=") == 0) {
-    // Parse joystick X value from URL query string
+    // Parse joystick X value
     int xStart = requestLine.indexOf("x=") + 2;
     int xEnd = requestLine.indexOf("&", xStart);
     if (xEnd == -1) xEnd = requestLine.indexOf(" ", xStart);
     String xStr = requestLine.substring(xStart, xEnd);
-    joystickX = xStr.toInt();  // Update global joystickX variable
+    joystickX = xStr.toInt();
     
-    // Parse joystick Y value from URL query string
+    // Parse joystick Y value
     int yStart = requestLine.indexOf("y=") + 2;
     int yEnd = requestLine.indexOf(" ", yStart);
     String yStr = requestLine.substring(yStart, yEnd);
-    joystickY = yStr.toInt();  // Update global joystickY variable
+    joystickY = yStr.toInt();
     
-    // Send minimal JSON response for fast acknowledgement
-    client.println("HTTP/1.1 200 OK");
-    client.println("Content-Type: application/json");
-    client.println("Connection: close");
-    client.println();
-    client.print("{\"x\":");
-    client.print(joystickX);
-    client.print(",\"y\":");
-    client.print(joystickY);
-    client.println("}");
-    
-    client.stop();
-    return;
-    
-  // DEFAULT: No specific endpoint - send main web interface HTML page
-  // This massive HTML page contains the interactive control panel with:
-  //   - System info display (encoder counts, sensor readings)
-  //   - Buzzer & Lights control buttons
-  //   - Line following toggle
-  //   - Virtual joystick canvas with JavaScript
-  //   - Ultrasonic sensor display
+    responseBody = "{\"status\":\"ok\",\"x\":" + String(joystickX) + ",\"y\":" + String(joystickY) + "}";
   } else {
-    // Build complete HTML page for web interface
-    responseBody = "<!DOCTYPE html>";
-    responseBody += "<html><head><title>ESP32 Control</title>";
-    
-    // CSS Styles for web interface
+    responseBody = "<!DOCTYPE html><html><head><title>ESP32 Control</title>";
     responseBody += "<style>";
-    responseBody += "body { font-family: Arial; margin: 20px; background: #f0f0f0; }";
-    responseBody += "h1 { color: #333; }";
-    responseBody += ".info { background: white; padding: 15px; border-radius: 5px; margin: 10px 0; }";
-    responseBody += ".section { background: white; padding: 15px; border-radius: 5px; margin: 15px 0; }";
-    responseBody += "button { padding: 10px 20px; margin: 5px; font-size: 14px; border: none; border-radius: 5px; cursor: pointer; background: #007bff; color: white; }";
-    responseBody += "button:hover { background: #0056b3; }";
-    responseBody += "button:active { transform: scale(0.98); }";
-    responseBody += ".status { margin-top: 10px; padding: 10px; background: #e7f3ff; border-left: 4px solid #007bff; }";
+    responseBody += "body{font-family:Arial;margin:20px;background:#f0f0f0;}";
+    responseBody += "h1{color:#333;}";
+    responseBody += ".info,.section{background:white;padding:15px;border-radius:6px;margin:12px 0;}";
+    responseBody += "button{padding:10px 18px;margin:5px;font-size:14px;border:none;border-radius:5px;cursor:pointer;background:#007bff;color:white;}";
+    responseBody += "button:hover{background:#0056b3;}";
+    responseBody += ".status{margin-top:10px;padding:10px;background:#e7f3ff;border-left:4px solid #007bff;display:none;}";
+    responseBody += ".joystick-panel{text-align:center;}";
+    responseBody += "#joystick{display:block;margin:10px auto 0 auto;border:none;border-radius:22px;background:transparent;cursor:crosshair;touch-action:none;}";
     responseBody += "</style></head><body>";
+
     responseBody += "<h1>ESP32 Control Panel</h1>";
-    
-    // System Information Display
     responseBody += "<div class='info'>";
-    responseBody += "<p><strong>AP IP:</strong> ";
-    responseBody += WiFi.softAPIP().toString();  // Show ESP32's IP address
-    responseBody += "</p>";
-    responseBody += "<p><strong>Left Encoder:</strong> <span id='leftEnc'>";
-    responseBody += leftEncoderCount;  // Display left wheel encoder count
-    responseBody += "</span></p>";
-    responseBody += "<p><strong>Right Encoder:</strong> <span id='rightEnc'>";
-    responseBody += rightEncoderCount;  // Display right wheel encoder count
-    responseBody += "</span></p>";
-    responseBody += "<p><strong>Joystick Mode:</strong> <span id='joyMode'>";
-    responseBody += (joystickMode ? "ON" : "OFF");
-    responseBody += "</span></p>";
+    responseBody += "<p><strong>AP IP:</strong> " + WiFi.softAPIP().toString() + "</p>";
+    responseBody += "<p><strong>Left Encoder:</strong> " + String(leftEncoderCount) + "</p>";
+    responseBody += "<p><strong>Right Encoder:</strong> " + String(rightEncoderCount) + "</p>";
     responseBody += "</div>";
-    
-    // Buzzer & Lights Control Section
-    // Buttons call cmd() JavaScript function which makes GET requests
+
     responseBody += "<div class='section'><h2>Buzzer & Lights</h2>";
-    // Buttons trigger cmd() JavaScript function to make HTTP requests
     responseBody += "<button onclick='cmd(\"/buzzer\")'>Buzzer</button>";
-    responseBody += "<button onclick='cmd(\"/siren\")' style='background: #ff4444;'>Siren</button>";
     responseBody += "<button onclick='cmd(\"/front\")'>Front Lamp</button>";
     responseBody += "<button onclick='cmd(\"/rear\")'>Rear Lamp</button>";
     responseBody += "</div>";
-    
-    // Line Follow Control Section
+
     responseBody += "<div class='section'><h2>Line Follow</h2>";
-    responseBody += "<p>Phototransistor: <span id='sensorVal'>";
-    responseBody += String(sensorReading);  // Display current sensor reading
-    responseBody += "</span></p>";
-    responseBody += "<p>Status: <span id='lineStatus'>";
-    responseBody += (lineFollowing ? "ON" : "OFF");  // Show if line following is active
-    responseBody += "</span></p>";
-    responseBody += "<button onclick='cmd(\"/linefollow/toggle\")'> Toggle Line Follow</button>";
+    responseBody += "<p>Left: " + String(sensorLeft) + " Right: " + String(sensorRight) + "</p>";
+    responseBody += "<p>Status: " + String(lineFollowing ? "ON" : "OFF") + "</p>";
+    responseBody += "<button onclick='cmd(\"/linefollow/toggle\")'>Toggle Line Follow</button>";
     responseBody += "</div>";
-    
-    // Virtual Joystick Control Section
-    // HTML5 Canvas element for drawing interactive joystick
-    responseBody += "<div class='section'><h2>Virtual Joystick</h2>";
-    responseBody += "<canvas id='joystick' width='200' height='200' style='border:2px solid #ccc; border-radius:5px; background:#f9f9f9; cursor:crosshair; margin-top:10px;'></canvas>";
-    responseBody += "<p>X: <span id='joyX'>0</span> | Y: <span id='joyY'>0</span></p>";
-    responseBody += "</div>";
-    
-    // Status message display area (hidden by default)
-    responseBody += "<div id='status' class='status' style='display:none;'></div>";
-    
-    // ===== JAVASCRIPT CODE FOR WEB INTERFACE =====
-    responseBody += "<script>";
-    
-    // Joystick canvas and state variables
-    responseBody += "let canvas = document.getElementById('joystick');";
-    responseBody += "let ctx = canvas.getContext('2d');";
-    responseBody += "let joyX = 0, joyY = 0;";  // Current joystick position
-    responseBody += "let isMouseDown = false;";   // Track mouse button state
-    responseBody += "let touchId = null;";        // Track touch ID for mobile
-    responseBody += "";
-    
-    // Function: drawJoystick() - Renders joystick visual on canvas
-    // CALLED BY: Mouse/touch event handlers, sendJoystickUpdate()
-    responseBody += "function drawJoystick() {";
-    responseBody += "  ctx.fillStyle = '#f9f9f9';";
-    responseBody += "  ctx.fillRect(0, 0, 200, 200);";  // Clear canvas
-    responseBody += "  ctx.strokeStyle = '#ccc';";
-    responseBody += "  ctx.lineWidth = 2;";
-    responseBody += "  ctx.beginPath();";
-    responseBody += "  ctx.arc(100, 100, 80, 0, Math.PI * 2);";
-    responseBody += "  ctx.stroke();";
-    responseBody += "  ctx.strokeStyle = '#999';";
-    responseBody += "  ctx.beginPath();";
-    responseBody += "  ctx.moveTo(100, 20);";
-    responseBody += "  ctx.lineTo(100, 180);";
-    responseBody += "  ctx.moveTo(20, 100);";
-    responseBody += "  ctx.lineTo(180, 100);";
-    responseBody += "  ctx.stroke();";
-    // Draw crosshair guides and joystick knob
-    responseBody += "  let posX = 100 + (joyX / 100) * 70;";   // Convert X to pixel position
-    responseBody += "  let posY = 100 - (joyY / 100) * 70;";   // Convert Y to pixel position (inverted)
-    responseBody += "  ctx.fillStyle = joyX == 0 && joyY == 0 ? '#ccc' : '#007bff';";  // Gray when centered, blue when moved
-    responseBody += "  ctx.beginPath();";
-    responseBody += "  ctx.arc(posX, posY, 15, 0, Math.PI * 2);";  // Draw joystick knob circle
-    responseBody += "  ctx.fill();";
-    responseBody += "  document.getElementById('joyX').textContent = joyX;";  // Update X display
-    responseBody += "  document.getElementById('joyY').textContent = joyY;";  // Update Y display
-    responseBody += "}";
-    responseBody += "";
-    
-    // Function: handleJoystickMove(x, y) - Processes mouse/touch movement
-    // CALLED BY: Mouse/touch event listeners
-    // CALLS: sendJoystickUpdate(), drawJoystick()
-    responseBody += "function handleJoystickMove(x, y) {";
-    responseBody += "  let rect = canvas.getBoundingClientRect();";  // Get canvas position on screen
-    responseBody += "  let centerX = rect.width / 2;";               // Find center point
-    responseBody += "  let centerY = rect.height / 2;";
-    responseBody += "  let dx = x - rect.left - centerX;";           // Calculate distance from center
-    responseBody += "  let dy = y - rect.top - centerY;";
-    responseBody += "  let distance = Math.sqrt(dx * dx + dy * dy);";  // Distance from center
-    responseBody += "  let maxDistance = 70;";                       // Max joystick radius in pixels
-    responseBody += "  if (distance > maxDistance) {";               // Limit to circle boundary
-    responseBody += "    dx = (dx / distance) * maxDistance;";       // Constrain to max radius
-    responseBody += "    dy = (dy / distance) * maxDistance;";
-    responseBody += "  }";
-    responseBody += "  joyX = Math.round((dx / 70) * 100);";        // Convert to -100 to 100 range
-    responseBody += "  joyY = Math.round((dy / 70) * -100);";       // Invert Y (canvas Y is downward)
-    responseBody += "  joyX = Math.max(-100, Math.min(100, joyX));";  // Clamp to range
-    responseBody += "  joyY = Math.max(-100, Math.min(100, joyY));";
-    responseBody += "  sendJoystickUpdate();";  // CALLS: sendJoystickUpdate() to send to ESP32
-    responseBody += "  drawJoystick();";        // CALLS: drawJoystick() to redraw visual
-    responseBody += "}";
-    responseBody += "";
-    
-    // Function: sendJoystickUpdate() - Sends joystick values to ESP32
-    // CALLED BY: handleJoystickMove(), mouse/touch event handlers
-    // Makes HTTP GET request to /joystick/move endpoint
-    responseBody += "function sendJoystickUpdate() {";
-    responseBody += "  fetch('/joystick/move?x=' + joyX + '&y=' + joyY).catch(e => console.log('Error:', e));";
-    responseBody += "}";
-    responseBody += "";
-    
-    // Mouse event handlers for desktop interaction
-    responseBody += "canvas.addEventListener('mousedown', () => isMouseDown = true);";
-    responseBody += "canvas.addEventListener('mousemove', (e) => {";
-    responseBody += "  if (isMouseDown) handleJoystickMove(e.clientX, e.clientY);";  // CALLS: handleJoystickMove()
-    responseBody += "});";
-    responseBody += "canvas.addEventListener('mouseup', () => {";
-    responseBody += "  isMouseDown = false;";
-    responseBody += "  joyX = 0; joyY = 0;";  // Reset to center when released
-    responseBody += "  sendJoystickUpdate();";  // CALLS: sendJoystickUpdate() to send center position
-    responseBody += "  drawJoystick();";        // CALLS: drawJoystick() to redraw
-    responseBody += "});";
-    responseBody += "canvas.addEventListener('mouseleave', () => {";
-    responseBody += "  isMouseDown = false;";
-    responseBody += "  joyX = 0; joyY = 0;";  // Reset when mouse leaves canvas
-    responseBody += "  sendJoystickUpdate();";  // CALLS: sendJoystickUpdate()
-    responseBody += "  drawJoystick();";        // CALLS: drawJoystick()
-    responseBody += "});";
-    responseBody += "";
-    
-    // Touch event handlers for mobile/tablet interaction
-    responseBody += "canvas.addEventListener('touchstart', (e) => { touchId = e.touches[0].identifier; });";
-    responseBody += "canvas.addEventListener('touchmove', (e) => {";
-    responseBody += "  for (let t of e.touches) {";
-    responseBody += "    if (t.identifier === touchId) {";
-    responseBody += "      handleJoystickMove(t.clientX, t.clientY);";  // CALLS: handleJoystickMove()
-    responseBody += "      break;";
-    responseBody += "    }";
-    responseBody += "  }";
-    responseBody += "});";
-    responseBody += "canvas.addEventListener('touchend', (e) => {";
-    responseBody += "  joyX = 0; joyY = 0;";  // Reset to center when touch released
-    responseBody += "  sendJoystickUpdate();";  // CALLS: sendJoystickUpdate()
-    responseBody += "  drawJoystick();";        // CALLS: drawJoystick()
-    responseBody += "  touchId = null;";
-    responseBody += "});";
-    responseBody += "";
-    
-    // Initialize joystick display
-    responseBody += "drawJoystick();";  // CALLS: drawJoystick() on page load
-    responseBody += "";
-    
-    // Auto-refresh status values every 2 seconds
-    responseBody += "setInterval(() => {";
-    responseBody += "  fetch('/status')";
-    responseBody += "    .then(r => r.json())";
-    responseBody += "    .then(data => {";
-    responseBody += "      document.getElementById('sensorVal').textContent = data.sensor;";  
-    responseBody += "      document.getElementById('lineStatus').textContent = data.lineFollowing ? 'ON' : 'OFF';";  
-    responseBody += "      document.getElementById('joyMode').textContent = data.joystickMode ? 'ON' : 'OFF';";  
-    responseBody += "      document.getElementById('leftEnc').textContent = data.leftEncoder;";  
-    responseBody += "      document.getElementById('rightEnc').textContent = data.rightEncoder;";  
-    responseBody += "      let distText = data.distanceCm > 0 ? data.distanceCm + ' cm' : 'No object detected';";  
-    responseBody += "      if (data.distanceCm > 0 && data.distanceCm < " + String(OBSTACLE_DISTANCE_CM) + ") distText += ' <strong style=\\\"color: red;\\\">(OBSTACLE!)</strong>';";  
-    responseBody += "      document.getElementById('distanceDisplay').innerHTML = 'Distance: ' + distText;";  
-    responseBody += "    })";
-    responseBody += "    .catch(e => console.log('Status update error:', e));";  
-    responseBody += "}, 500);";  // Update every 500ms (half second)
-    responseBody += "";
-    
-    // Function: cmd(path) - Makes HTTP GET request to ESP32 endpoint
-    // CALLED BY: Button onclick handlers in HTML
-    // This function sends commands from buttons to ESP32
-    responseBody += "function cmd(path) {";
-    responseBody += "  fetch(path).then(r => r.text()).then(d => {";  // Make HTTP request
-    responseBody += "    let st = document.getElementById('status');";
-    responseBody += "    st.style.display = 'block';";
-    responseBody += "    st.innerHTML = '<strong>OK:</strong> ' + path;";  // Show success message
-    responseBody += "    setTimeout(() => st.style.display = 'none', 2000);";  // Hide after 2 seconds
-    responseBody += "  }).catch(e => {";
-    responseBody += "    document.getElementById('status').innerHTML = '<strong>Error:</strong> ' + e;";
-    responseBody += "    document.getElementById('status').style.display = 'block';";
-    responseBody += "  });";
-    responseBody += "}";
-    responseBody += "</script>";
-    
-    // Ultrasonic Sensor Display Section
-    responseBody += "<div class='section'><h2>Ultrasonic Sensor</h2>";
-    responseBody += "<p id='distanceDisplay'>Distance: ";
+
+    responseBody += "<div class='section'><h2>Ultrasonic Sensor</h2><p>Distance: ";
     if (distanceCm > 0) {
-      responseBody += String(distanceCm);  // Show measured distance
-      responseBody += " cm";
+      responseBody += String(distanceCm) + " cm";
       if (distanceCm < OBSTACLE_DISTANCE_CM) {
-        responseBody += " <strong style='color: red;'>(OBSTACLE!)</strong>";  // Warning if too close
+        responseBody += " <strong style='color:red;'>(OBSTACLE!)</strong>";
       }
     } else {
-      responseBody += "No object detected";  // No valid reading
+      responseBody += "No object detected";
     }
+    responseBody += "</p></div>";
+
+    responseBody += "<div class='section joystick-panel'><h2>Joystick Control</h2>";
+    responseBody += "<button onclick='cmd(\"/joystick/toggle\")'>";
+    responseBody += (joystickMode ? "Disable Joystick" : "Enable Joystick");
+    responseBody += "</button>";
+    responseBody += "<p>Status: ";
+    responseBody += (joystickMode ? "<span style='color:green;'><strong>ENABLED</strong></span>" : "<span style='color:red;'>DISABLED</span>");
     responseBody += "</p>";
+    responseBody += "<canvas id='joystick' width='320' height='320'></canvas>";
+    responseBody += "<p>X: <span id='joyX'>0</span> | Y: <span id='joyY'>0</span></p>";
     responseBody += "</div>";
-    
-    responseBody += "</body></html>";  // Close HTML page
+
+    responseBody += "<div id='status' class='status'></div>";
+    responseBody += "<script>";
+    responseBody += "const canvas=document.getElementById('joystick');";
+    responseBody += "const ctx=canvas.getContext('2d');";
+    responseBody += "let joyX=0,joyY=0,isMouseDown=false,touchId=null;";
+    responseBody += "let inFlight=false,pending=false,pendingX=0,pendingY=0;";
+    responseBody += "const JOY_SIZE=canvas.width,JOY_CENTER=JOY_SIZE/2,JOY_RADIUS=JOY_SIZE*0.4,KNOB_TRAVEL=JOY_SIZE*0.35,KNOB_RADIUS=JOY_SIZE*0.075;";
+
+    responseBody += "function drawJoystick(){";
+    responseBody += "ctx.clearRect(0,0,JOY_SIZE,JOY_SIZE);";
+    responseBody += "const bg=ctx.createRadialGradient(JOY_CENTER,JOY_CENTER,JOY_RADIUS*0.2,JOY_CENTER,JOY_CENTER,JOY_RADIUS*1.2);";
+    responseBody += "bg.addColorStop(0,'#ffffff');bg.addColorStop(1,'#f9f9f9');";
+    responseBody += "ctx.fillStyle=bg;ctx.beginPath();ctx.arc(JOY_CENTER,JOY_CENTER,JOY_RADIUS+8,0,Math.PI*2);ctx.fill();";
+    responseBody += "ctx.shadowColor='#999';ctx.shadowBlur=16;ctx.strokeStyle='#ccc';ctx.lineWidth=8;ctx.beginPath();ctx.arc(JOY_CENTER,JOY_CENTER,JOY_RADIUS,0,Math.PI*2);ctx.stroke();ctx.shadowBlur=0;";
+    responseBody += "ctx.strokeStyle='#ccc';ctx.lineWidth=1;ctx.beginPath();ctx.arc(JOY_CENTER,JOY_CENTER,JOY_RADIUS*0.55,0,Math.PI*2);ctx.stroke();";
+    responseBody += "const posX=JOY_CENTER+(joyX/100)*KNOB_TRAVEL;const posY=JOY_CENTER-(joyY/100)*KNOB_TRAVEL;";
+    responseBody += "ctx.strokeStyle='#999';ctx.lineWidth=3;ctx.beginPath();ctx.moveTo(JOY_CENTER,JOY_CENTER);ctx.lineTo(posX,posY);ctx.stroke();";
+    responseBody += "ctx.fillStyle='#ccc';ctx.beginPath();ctx.arc(posX,posY,KNOB_RADIUS+10,0,Math.PI*2);ctx.fill();";
+    responseBody += "const knob=ctx.createRadialGradient(posX-KNOB_RADIUS*0.35,posY-KNOB_RADIUS*0.35,KNOB_RADIUS*0.2,posX,posY,KNOB_RADIUS);";
+    responseBody += "knob.addColorStop(0,'#ffffff');knob.addColorStop(1,'#007bff');";
+    responseBody += "ctx.fillStyle=knob;ctx.beginPath();ctx.arc(posX,posY,KNOB_RADIUS,0,Math.PI*2);ctx.fill();";
+    responseBody += "ctx.fillStyle='#ffffff';ctx.beginPath();ctx.arc(posX-KNOB_RADIUS*0.25,posY-KNOB_RADIUS*0.25,KNOB_RADIUS*0.22,0,Math.PI*2);ctx.fill();";
+    responseBody += "document.getElementById('joyX').textContent=joyX;document.getElementById('joyY').textContent=joyY;";
+    responseBody += "}";
+
+    responseBody += "function queueSend(){pendingX=joyX;pendingY=joyY;pending=true;if(!inFlight)sendJoystick();}";
+    responseBody += "function sendJoystick(){if(!pending)return;inFlight=true;pending=false;const x=pendingX,y=pendingY;fetch('/joystick/move?x='+x+'&y='+y).catch(()=>{}).finally(()=>{inFlight=false;if(pending)sendJoystick();});}";
+    responseBody += "function handleJoystickMove(x,y){const r=canvas.getBoundingClientRect();let dx=x-r.left-r.width/2;let dy=y-r.top-r.height/2;const d=Math.sqrt(dx*dx+dy*dy);if(d>KNOB_TRAVEL){dx=(dx/d)*KNOB_TRAVEL;dy=(dy/d)*KNOB_TRAVEL;}joyX=Math.max(-100,Math.min(100,Math.round((dx/KNOB_TRAVEL)*100)));joyY=Math.max(-100,Math.min(100,Math.round((dy/KNOB_TRAVEL)*-100)));queueSend();drawJoystick();}";
+
+    responseBody += "canvas.addEventListener('mousedown',()=>isMouseDown=true);";
+    responseBody += "canvas.addEventListener('mousemove',e=>{if(isMouseDown)handleJoystickMove(e.clientX,e.clientY);});";
+    responseBody += "canvas.addEventListener('mouseup',()=>{isMouseDown=false;joyX=0;joyY=0;queueSend();drawJoystick();});";
+    responseBody += "canvas.addEventListener('mouseleave',()=>{isMouseDown=false;joyX=0;joyY=0;queueSend();drawJoystick();});";
+    responseBody += "canvas.addEventListener('touchstart',e=>{e.preventDefault();touchId=e.touches[0].identifier;},{passive:false});";
+    responseBody += "canvas.addEventListener('touchmove',e=>{e.preventDefault();for(const t of e.touches){if(t.identifier===touchId){handleJoystickMove(t.clientX,t.clientY);break;}}},{passive:false});";
+    responseBody += "canvas.addEventListener('touchend',e=>{e.preventDefault();joyX=0;joyY=0;queueSend();drawJoystick();touchId=null;},{passive:false});";
+
+    responseBody += "function cmd(path){fetch(path).then(r=>r.text()).then(()=>{const st=document.getElementById('status');st.style.display='block';st.innerHTML='<strong>OK:</strong> '+path;if(path==='/joystick/toggle'){setTimeout(()=>location.reload(),200);}setTimeout(()=>st.style.display='none',2000);}).catch(e=>{const st=document.getElementById('status');st.innerHTML='<strong>Error:</strong> '+e;st.style.display='block';});}";
+    responseBody += "drawJoystick();";
+    responseBody += "</script></body></html>";
   }
 
-  // Send HTTP response back to browser
-  // CALLS: sendHttpResponse() to send the HTML/JSON response
   sendHttpResponse(client, responseBody);
-  delay(1);         // Brief delay for stability
-  client.stop();    // Close client connection
+  delay(1);
+  client.stop();
 }
 
-// ============================================================================
-// MAIN LOOP - CALLED REPEATEDLY: Runs continuously after setup() completes
-// ============================================================================
 void loop() {
   unsigned long now = millis();
-  
-  // CALLS: updateSiren() - Update siren effect if active (non-blocking)
-  updateSiren();
-  
-  // CALLS: updateBuzzer() - Update buzzer state if active (non-blocking)
-  updateBuzzer();
-  
-  // CALLS: updateLamps() - Update lamp states if active (non-blocking)
-  updateLamps();
-  
-  // Rate-limited sensor reading and control logic (every READ_INTERVAL_MS = 20ms)
   if (now - lastLineRead >= READ_INTERVAL_MS) {
     lastLineRead = now;
     
-    // CALLS: readUltrasonicDistance() - Check for obstacles
+    // Check ultrasonic distance
     distanceCm = readUltrasonicDistance();
     
-    // PRIORITY 1: Emergency stop if obstacle detected
-    // CALLS: motorStop() to halt all movement
+    // Emergency stop if obstacle too close
     if (distanceCm > 0 && distanceCm < OBSTACLE_DISTANCE_CM) {
-      motorStop();           // CALLS: motorStop() for safety
-      lineFollowing = false; // Disable line following mode
-      
-    // PRIORITY 2: Joystick control mode (default mode)
+      motorStop();
+      lineFollowing = false;
+      joystickMode = true;
+      joystickX = 0;
+      joystickY = 0;
+      Serial.print("Obstacle detected at ");
+      Serial.print(distanceCm);
+      Serial.println(" cm - STOPPED");
     } else if (joystickMode) {
-      // CALLS: handleJoystickControl() to process virtual joystick input
-      // Uses joystickX and joystickY values set by web interface
+      // Joystick control enabled
       handleJoystickControl(joystickX, joystickY);
-      
-    // PRIORITY 3: Line following mode (when enabled via web interface)
     } else if (lineFollowing) {
-      // CALLS: runLineFollow() to execute line following algorithm
       runLineFollow();
-      
-    // PRIORITY 4: Idle mode - just update sensor reading for web UI
     } else {
-      // CALLS: readAverage() - Keep sensor reading fresh for web interface display
-      sensorReading = readAverage(PHOTOTRANSISTOR_PIN, 2);
+      // keep sensors updated for the web UI
+      sensorLeft = readAverage(SENSOR_LEFT_PIN, 2);
+      sensorRight = readAverage(SENSOR_RIGHT_PIN, 2);
     }
   }
 
-  // CALLS: handleClient() - Check for and process incoming web requests
-  WiFiClient client = server.available();  // Check if client connected
+  WiFiClient client = server.available();
   if (client) {
-    handleClient(client);  // CALLS: handleClient() to process HTTP request
+    handleClient(client);
   }
-  
-  delay(1);  // Small delay to prevent watchdog timer reset
+  delay(1);
 }
