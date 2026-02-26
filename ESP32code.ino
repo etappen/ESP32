@@ -220,16 +220,16 @@ void runLineFollow() {
       delay(sweep);
       goingLeft = false;
       if (seesBlack()) {
-        pivotLeftInPlace(LINE_SWEEP_SPEED);
-        delay(3);
+        motorForward(200);
+        return;
       }
     } else {
       pivotRightInPlace(LINE_SWEEP_SPEED);
       delay(sweep);
       goingLeft = true;
       if (seesBlack()) {
-        pivotRightInPlace(LINE_SWEEP_SPEED);
-        delay(3);
+        motorForward(200);
+        return;
       }
     }
 
