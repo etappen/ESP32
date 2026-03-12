@@ -62,8 +62,8 @@ int joystickY = 0;  // -100 to 100
 bool joystickMode = true;  // Joystick control ON by default
 
 // Access Point settings
-const char* ap_ssid = "Mater";
-const char* ap_pass = "cars808";
+const char* ap_ssid = "JohnDeer";
+const char* ap_pass = "tractor80085";
 
 WiFiServer server(80);
 
