@@ -41,7 +41,7 @@ const int OBSTACLE_DISTANCE_CM = 5;  // Stop if object closer than this
 // ADC and line-follow parameters
 const int READ_INTERVAL_MS = 100;
 const int AVG_SAMPLES = 6;
-const int BLACK_THRESHOLD = 3800;
+const int BLACK_THRESHOLD = 3300;
 const int UPDATE_INTERVAL = 20;
 const int LINE_SWEEP_SPEED = 180;
 // Ultrasonic sampling
@@ -61,9 +61,19 @@ int joystickX = 0;  // -100 to 100
 int joystickY = 0;  // -100 to 100
 bool joystickMode = true;  // Joystick control ON by default
 
-// Access Point settings
+// Access Point settings (updated for UDP control)
 const char* ap_ssid = "JohnDeere";
 const char* ap_pass = "tractor80085";
+
+// UDP control settings
+#include <WiFiUdp.h>
+const char* sta_ssid = "SU-ECE-LAB";
+const char* sta_password = "FaraDay8086!";
+WiFiUDP udp;
+#define UDP_PORT 4210
+char incomingPacket[255];
+int robotID = 19;
+#define UDP_LED_PIN 2
 
 WiFiServer server(80);
 
@@ -87,33 +97,20 @@ void IRAM_ATTR handleRightEncoderA() {
 void setup() {
   Serial.begin(115200);
   delay(1000);
-  
-  Serial.println("\n\n=== ESP32 LED & Horn Control with Motors ===");
-  
-  // Start Access Point (no external network connection needed)
-  WiFi.mode(WIFI_AP); // AP only mode
-  Serial.println("\nStarting Access Point...");
+  WiFi.mode(WIFI_AP_STA);
   WiFi.softAP(ap_ssid, ap_pass);
-  Serial.print("AP SSID: ");
-  Serial.println(ap_ssid);
-  Serial.print("AP IP: ");
-  Serial.println(WiFi.softAPIP());
-
+  WiFi.begin(sta_ssid, sta_password);
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500);
+  }
+  Serial.println(WiFi.localIP());
+  udp.begin(UDP_PORT);
   server.begin();
-  Serial.println("\nWeb server started on port 80");
-  // ADC setup for line sensors
   analogReadResolution(12);
   analogSetPinAttenuation(SENSOR_LEFT_PIN, ADC_11db);
   analogSetPinAttenuation(SENSOR_RIGHT_PIN, ADC_11db);
-  Serial.println("Line sensors initialized");
-  
-  // Ultrasonic sensor setup
   pinMode(TRIG_PIN, OUTPUT);
   pinMode(ECHO_PIN, INPUT);
-  Serial.println("Ultrasonic sensor initialized");
-  // Initialize buzzer PWM (LEDC)
-  // Use simple digital pin for buzzer (manual tone generator used)
-  // Motor control pins as outputs
   pinMode(LEFT_EN, OUTPUT);
   pinMode(LEFT_IN1, OUTPUT);
   pinMode(LEFT_IN2, OUTPUT);
@@ -135,12 +132,11 @@ void setup() {
 
   pinMode(FRONTLAMPS, OUTPUT);
   pinMode(REARLAMPS, OUTPUT);
+  pinMode(UDP_LED_PIN, OUTPUT); // For UDP dance routine
 }
-
 void sendHttpResponse(WiFiClient &client, const String &body) {
   client.println("HTTP/1.1 200 OK");
   client.println("Content-Type: text/html");
-  client.println("Connection: close");
   client.println();
   client.println(body);
 }
@@ -154,7 +150,6 @@ long readAverage(int pin, int samples) {
   return sum / samples;
 }
 
-// Read ultrasonic distance in cm
 long readUltrasonicDistance() {
   long totalDistance = 0;
   int valid = 0;
@@ -167,12 +162,10 @@ long readUltrasonicDistance() {
 
     long duration = pulseIn(ECHO_PIN, HIGH, 30000);  // 30ms timeout
     if (ULTRASONIC_DEBUG) {
-      Serial.print("Ultrasonic raw duration: "); Serial.println(duration);
+      // ...removed serial print...
     }
     if (duration > 0) {
-      // distance = (duration in microseconds * speed of sound) / 2
-      // speed of sound = 343 m/s = 0.0343 cm/microsecond
-      long distance = (duration * 343) / 20000;  // ~ duration * 0.01715
+      long distance = (duration * 343) / 20000;
       totalDistance += distance;
       valid++;
     }
@@ -180,13 +173,15 @@ long readUltrasonicDistance() {
   }
 
   if (valid == 0) {
-    if (ULTRASONIC_DEBUG) Serial.println("Ultrasonic: timeout / no echo");
+    if (ULTRASONIC_DEBUG) {
+      // ...removed serial print...
+    }
     return 0;
   }
 
   long avg = totalDistance / valid;
   if (ULTRASONIC_DEBUG) {
-    Serial.print("Ultrasonic distance (cm) avg: "); Serial.println(avg);
+    // ...removed serial print...
   }
   return avg;
 }
@@ -203,12 +198,11 @@ void runLineFollow() {
   if (now - lastLineFollowUpdate < UPDATE_INTERVAL) return;
   lastLineFollowUpdate = now;
 
-  // Keep sensor values updated for UI
   sensorLeft = readAverage(SENSOR_LEFT_PIN, AVG_SAMPLES);
   sensorRight = readAverage(SENSOR_RIGHT_PIN, AVG_SAMPLES);
 
   if (seesBlack()) {
-    motorForward(200);
+    motorForward(150);
     return;
   }
 
@@ -220,7 +214,7 @@ void runLineFollow() {
       delay(sweep);
       goingLeft = false;
       if (seesBlack()) {
-        motorForward(200);
+        motorForward(150);
         return;
       }
     } else {
@@ -228,11 +222,10 @@ void runLineFollow() {
       delay(sweep);
       goingLeft = true;
       if (seesBlack()) {
-        motorForward(200);
+        motorForward(150);
         return;
       }
     }
-
     if (!seesBlack()) {
       if (goingLeft) {
         pivotLeftInPlace(LINE_SWEEP_SPEED);
@@ -244,25 +237,19 @@ void runLineFollow() {
     }
     sweep += 7;
   }
-
   if (seesBlack()) {
-    motorForward(200);
+    motorForward(150);
     return;
   }
-
   motorStop();
 }
 
 void BuzzerTest() {
-  // Play two short tones for an audible beep using manual toggling
-  Serial.println("Buzzer Test - ON");
   playTone(BUZZER_PIN, BUZZER_FREQ, 300);
   delay(150);
   playTone(BUZZER_PIN, BUZZER_FREQ, 300);
-  Serial.println("Buzzer Test Complete");
 }
 
-// Simple blocking tone generator using digital toggling (works when LEDC not available)
 void playTone(int pin, int freq, int duration_ms) {
   if (freq <= 0 || duration_ms <= 0) return;
   unsigned long period_us = 1000000UL / (unsigned long)freq;
@@ -276,87 +263,61 @@ void playTone(int pin, int freq, int duration_ms) {
   }
 }
 
-void FrontLampTest(){
-  Serial.println("Front Lamp Test");
+void FrontLampTest() {
   digitalWrite(FRONTLAMPS, HIGH);
   delay(1000);
   digitalWrite(FRONTLAMPS, LOW);
 }
 
-void RearLampTest(){
-  Serial.println("Rear Lamp Test");
+void RearLampTest() {
   digitalWrite(REARLAMPS, HIGH);
   delay(1000);
   digitalWrite(REARLAMPS, LOW);
 }
 
-// Motor control functions
 void motorForward(uint8_t speed) {
-  Serial.println("Motors Forward");
-
-  // Left motor forward
   digitalWrite(LEFT_IN1, HIGH);
   digitalWrite(LEFT_IN2, LOW);
-  digitalWrite(LEFT_EN, HIGH);
-
-  // Right motor forward
+  analogWrite(LEFT_EN, speed);
   digitalWrite(RIGHT_IN1, HIGH);
   digitalWrite(RIGHT_IN2, LOW);
-  digitalWrite(RIGHT_EN, HIGH);
+  analogWrite(RIGHT_EN, speed);
 }
 
 void motorBackward(uint8_t speed) {
-  Serial.println("Motors Backward");
-
-  // Left motor backward
   digitalWrite(LEFT_IN1, LOW);
   digitalWrite(LEFT_IN2, HIGH);
-  digitalWrite(LEFT_EN, HIGH);
-
-  // Right motor backward
+  analogWrite(LEFT_EN, speed);
   digitalWrite(RIGHT_IN1, LOW);
   digitalWrite(RIGHT_IN2, HIGH);
-  digitalWrite(RIGHT_EN, HIGH);
+  analogWrite(RIGHT_EN, speed);
 }
 
 void motorStop() {
-  Serial.println("Motors Stopped");
-  
-  // Left motor stop
   digitalWrite(LEFT_IN1, LOW);
   digitalWrite(LEFT_IN2, LOW);
-  digitalWrite(LEFT_EN, LOW);
-  
-  // Right motor stop
+  analogWrite(LEFT_EN, 0);
   digitalWrite(RIGHT_IN1, LOW);
   digitalWrite(RIGHT_IN2, LOW);
-  digitalWrite(RIGHT_EN, LOW);
+  analogWrite(RIGHT_EN, 0);
 }
 
 void motorLeft(uint8_t speed) {
-  Serial.println("Turn Left");
-
-  // Left motor stop, right motor forward
   digitalWrite(LEFT_IN1, HIGH);
   digitalWrite(LEFT_IN2, LOW);
-  digitalWrite(LEFT_EN, LOW);
-
+  analogWrite(LEFT_EN, 0);
   digitalWrite(RIGHT_IN1, HIGH);
   digitalWrite(RIGHT_IN2, LOW);
-  digitalWrite(RIGHT_EN, HIGH);
+  analogWrite(RIGHT_EN, speed);
 }
 
 void motorRight(uint8_t speed) {
-  Serial.println("Turn Right");
-
-  // Left motor forward, right motor stop
   digitalWrite(LEFT_IN1, HIGH);
   digitalWrite(LEFT_IN2, LOW);
-  digitalWrite(LEFT_EN, HIGH);
-
+  analogWrite(LEFT_EN, speed);
   digitalWrite(RIGHT_IN1, HIGH);
   digitalWrite(RIGHT_IN2, LOW);
-  digitalWrite(RIGHT_EN, LOW);
+  analogWrite(RIGHT_EN, 0);
 }
 
 void pivotLeftInPlace(uint8_t speed) {
@@ -380,52 +341,71 @@ void pivotRightInPlace(uint8_t speed) {
 }
 
 // Joystick control function - maps joystick values to motor speeds
+// Responsive joystick control: direct mapping with smoothing and small deadzone
+float joyXFiltered = 0;
+float joyYFiltered = 0;
+const float FILTER_ALPHA = 0.25; // Smoothing factor (0.0-1.0)
+const int PRECISE_DEADZONE = 8;  // Small deadzone for precision
+const float PRECISE_SCALE = 2.55f; // Full PWM range
+
 void handleJoystickControl(int joyX, int joyY) {
-  // joyX and joyY are in range -100 to 100 from web interface
-  // Map to full PWM range so joystick can command maximum motor speed
-  joyX = (int)(joyX * 2.55f);
-  joyY = (int)(joyY * 2.55f);
+  // Smoothing/filtering
+  joyXFiltered = FILTER_ALPHA * joyX + (1.0 - FILTER_ALPHA) * joyXFiltered;
+  joyYFiltered = FILTER_ALPHA * joyY + (1.0 - FILTER_ALPHA) * joyYFiltered;
 
-  // Calculate motor speeds based on differential drive
-  // Forward/Backward: Y axis (positive = forward, negative = backward)
-  // Left/Right: X axis (positive = turn right, negative = turn left)
-  int leftMotorSpeed = joyY + joyX;
-  int rightMotorSpeed = joyY - joyX;
-
-  // Limit motor speeds to [-255, 255]
-  leftMotorSpeed = constrain(leftMotorSpeed, -255, 255);
-  rightMotorSpeed = constrain(rightMotorSpeed, -255, 255);
-
-  // Control motors based on speeds
-  if (leftMotorSpeed == 0 && rightMotorSpeed == 0) {
+  // Deadzone for small joystick movements
+  if (abs(joyXFiltered) < PRECISE_DEADZONE && abs(joyYFiltered) < PRECISE_DEADZONE) {
     motorStop();
-  } else {
-    // Left motor
-    if (leftMotorSpeed > 0) {
-      digitalWrite(LEFT_IN1, HIGH);
-      digitalWrite(LEFT_IN2, LOW);
-    } else if (leftMotorSpeed < 0) {
-      digitalWrite(LEFT_IN1, LOW);
-      digitalWrite(LEFT_IN2, HIGH);
-    } else {
-      digitalWrite(LEFT_IN1, LOW);
-      digitalWrite(LEFT_IN2, LOW);
-    }
-    analogWrite(LEFT_EN, abs(leftMotorSpeed));
-
-    // Right motor
-    if (rightMotorSpeed > 0) {
-      digitalWrite(RIGHT_IN1, HIGH);
-      digitalWrite(RIGHT_IN2, LOW);
-    } else if (rightMotorSpeed < 0) {
-      digitalWrite(RIGHT_IN1, LOW);
-      digitalWrite(RIGHT_IN2, HIGH);
-    } else {
-      digitalWrite(RIGHT_IN1, LOW);
-      digitalWrite(RIGHT_IN2, LOW);
-    }
-    analogWrite(RIGHT_EN, abs(rightMotorSpeed));
+    return;
   }
+
+  // Map to full PWM range [-255, 255]
+  int pwmX = (int)(joyXFiltered * PRECISE_SCALE);
+  int pwmY = (int)(joyYFiltered * PRECISE_SCALE);
+
+  // Scale turn aggressiveness by forward speed (gentler turns at low speed)
+  float turnScale = abs(pwmY) / 150.0; // 0 (no forward) to 1 (full speed)
+  if (turnScale > 1.0) turnScale = 1.0;
+  int scaledPwmX = (int)(pwmX * turnScale);
+
+  // Differential drive: Y positive = forward, X positive = right
+  int leftMotorSpeed = pwmY + scaledPwmX;
+  int rightMotorSpeed = pwmY - scaledPwmX;
+
+  // Limit motor speeds to [-250, 250] for safer, slower control
+  leftMotorSpeed = constrain(leftMotorSpeed, -250, 250);
+  rightMotorSpeed = constrain(rightMotorSpeed, -250, 250);
+
+  // Minimum PWM threshold for non-zero speeds
+  const int MIN_PWM = 30;
+  int leftPwm = (leftMotorSpeed != 0) ? max(abs(leftMotorSpeed), MIN_PWM) : 0;
+  int rightPwm = (rightMotorSpeed != 0) ? max(abs(rightMotorSpeed), MIN_PWM) : 0;
+
+  // Left motor direction
+  if (leftMotorSpeed > 0) {
+    digitalWrite(LEFT_IN1, HIGH);
+    digitalWrite(LEFT_IN2, LOW);
+  } else if (leftMotorSpeed < 0) {
+    digitalWrite(LEFT_IN1, LOW);
+    digitalWrite(LEFT_IN2, HIGH);
+  } else {
+    digitalWrite(LEFT_IN1, LOW);
+    digitalWrite(LEFT_IN2, LOW);
+  }
+  analogWrite(LEFT_EN, leftPwm);
+
+  // Right motor direction
+  if (rightMotorSpeed > 0) {
+    digitalWrite(RIGHT_IN1, HIGH);
+    digitalWrite(RIGHT_IN2, LOW);
+  } else if (rightMotorSpeed < 0) {
+    digitalWrite(RIGHT_IN1, LOW);
+    digitalWrite(RIGHT_IN2, HIGH);
+  } else {
+    digitalWrite(RIGHT_IN1, LOW);
+    digitalWrite(RIGHT_IN2, LOW);
+  }
+  analogWrite(RIGHT_EN, rightPwm);
 }
 
 void handleClient(WiFiClient client) {
@@ -618,10 +598,19 @@ void loop() {
   unsigned long now = millis();
   if (now - lastLineRead >= READ_INTERVAL_MS) {
     lastLineRead = now;
-    
+
+    // UDP packet handling
+    int packetSize = udp.parsePacket();
+    if (packetSize) {
+      int len = udp.read(incomingPacket, 255);
+      if (len > 0) incomingPacket[len] = 0;
+      String command = String(incomingPacket);
+      handleUDPCommand(command);
+    }
+
     // Check ultrasonic distance
     distanceCm = readUltrasonicDistance();
-    
+
     // Emergency stop if obstacle too close
     if (distanceCm > 0 && distanceCm < OBSTACLE_DISTANCE_CM) {
       motorStop();
@@ -649,4 +638,47 @@ void loop() {
     handleClient(client);
   }
   delay(1);
+}
+
+// UDP command handler
+void handleUDPCommand(String cmd) {
+  if (cmd == "DANCE_ALL") {
+    udpDance();
+  }
+  if (cmd.startsWith("DANCE_")) {
+    int target = cmd.substring(6).toInt();
+    if (target == robotID) {
+      udpDance();
+    }
+  }
+}
+
+// UDP dance routine (LED blink)
+void udpDance() {
+  Serial.println("Robot Dancing!");
+  // Siren buzzer effect while dancing
+  for(int i=0;i<6;i++){
+    // Alternate front/rear lamps quickly
+    for (int j = 0; j < 8; j++) {
+      if (j % 2 == 0) {
+        digitalWrite(FRONTLAMPS, HIGH);
+        digitalWrite(REARLAMPS, LOW);
+      } else {
+        digitalWrite(FRONTLAMPS, LOW);
+        digitalWrite(REARLAMPS, HIGH);
+      }
+      delay(40);
+    }
+    digitalWrite(FRONTLAMPS, LOW);
+    digitalWrite(REARLAMPS, LOW);
+
+    // Siren buzzer: sweep frequency up and down
+    for (int freq = 1000; freq <= 2500; freq += 100) {
+      playTone(BUZZER_PIN, freq, 10);
+    }
+    for (int freq = 2500; freq >= 1000; freq -= 100) {
+      playTone(BUZZER_PIN, freq, 10);
+    }
+    delay(100);
+  }
 }
